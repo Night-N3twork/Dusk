@@ -25,8 +25,22 @@ export const BUILTIN_BINARIES: Record<string, string> = {
 
 // Just-bash commands: thin wrappers that shell out to /bin/dsh so users can
 // invoke `grep`, `sed`, `awk`, etc. directly at a shell prompt without the
-// `dsh -c "..."` incantation. Each wrapper does spawnSync('/bin/dsh', ['-c', name + args], {stdin}) and forwards status/stdout/stderr.
-const JSH_COMMANDS = [
+// `dsh -c "..."` incantation.
+//
+// Two dispatch paths exist:
+//
+//   1. Elision (fast path): the ProcessManager checks JSH_COMMAND_SET before
+//      spawning and, if the command is in the set, rewrites the spawn to
+//      `/bin/dsh -c '<name> <args>'` directly. This saves a whole
+//      SpiderMonkey Worker (~100MB) per invocation by avoiding the
+//      intermediate JSH-wrapper process. See process-manager.ts spawn().
+//
+//   2. Fallback wrapper (slow path): if the elision was bypassed for any
+//      reason and /bin/grep etc. are actually spawned, this in-engine
+//      wrapper reads stdin then spawnSync('/bin/dsh', ['-c', script])s
+//      inside its own worker. Kept as a safety net; every current call
+//      site goes through the fast path.
+export const JSH_COMMANDS = [
   // Text processing
   'grep', 'egrep', 'fgrep', 'rg', 'sed', 'awk', 'sort', 'uniq', 'cut', 'paste',
   'tac', 'tr', 'tee', 'fold', 'expand', 'nl', 'rev', 'od',
@@ -75,6 +89,15 @@ const buildJshWrapper = (cmdName: string): string => {
     + "  process.exit(r.status || 0);\n"
     + "})();";
 };
+
+// Fast-path set: names in this set get their /bin/<name> spawn rewritten
+// to /bin/dsh -c '<name> ...' by ProcessManager. Excludes any name that
+// happens to also be a native builtin (checked below).
+export const JSH_COMMAND_SET: Set<string> = new Set(
+  JSH_COMMANDS
+    .map((n) => '/bin/' + n)
+    .filter((k) => !Object.prototype.hasOwnProperty.call(BUILTIN_BINARIES, k)),
+);
 
 for (const name of JSH_COMMANDS) {
   const key = '/bin/' + name;

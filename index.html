@@ -21,6 +21,8 @@
     <div id="examples"></div>
     <h4>Node REPL examples <small style="font-weight:normal;color:#888;">— run `node` first to enter the REPL, then click these. `.exit` returns to dsh.</small></h4>
     <div id="node-examples"></div>
+    <h4>node:crypto examples <small style="font-weight:normal;color:#888;">— run `node` first. Hashes/HMAC/AES/RSA/ECDSA/PBKDF2/WebCrypto. RSA/EC keypair gen takes 2-5s.</small></h4>
+    <div id="crypto-examples"></div>
     <h4>sqlite3 examples <small style="font-weight:normal;color:#888;">— sql.js on the host, TFS-persistent DB files.</small></h4>
     <div id="sqlite-examples"></div>
     <h4>python3 examples <small style="font-weight:normal;color:#888;">— Pyodide on the host, ~10MB download on first use.</small></h4>
@@ -30,6 +32,6 @@
       <button id="clearfs">Clear FS</button>
       <pre id="fsview"></pre>
     </div>
-    <script type="module" src="/src/index.ts"></script>
+    <script type="module" src="/src/demo/main.ts"></script>
   </body>
 </html>

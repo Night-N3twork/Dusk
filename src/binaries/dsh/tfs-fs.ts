@@ -131,11 +131,22 @@ export class TfsFs {
 
   async stat(path: string): Promise<{ isFile: boolean; isDirectory: boolean; isSymbolicLink: boolean; mode: number; size: number; mtime: Date }> {
     const s = this.fs().stat(path);
+    // Mode selection: TFS itself has no permission model, so we synthesize
+    // POSIX-ish modes from path convention. Files under /bin/ and /usr/bin/
+    // are executable (0o755) — they're binary stubs backed by the synthetic
+    // /bin layout backend, and just-bash's PATH resolver requires an
+    // executable bit to accept a lazy binary that lacks a registered
+    // just-bash command handler (see command-resolution.ts:139). Without
+    // this, `npm`, `npx`, `dpm`, etc. resolve to file-exists but not
+    // executable → "command not found".
+    const isBinDir = path === '/bin' || path.startsWith('/bin/') ||
+                     path === '/usr/bin' || path.startsWith('/usr/bin/');
+    const mode = s.isDirectory ? 0o755 : (isBinDir ? 0o755 : 0o644);
     return {
       isFile: !!s.isFile,
       isDirectory: !!s.isDirectory,
       isSymbolicLink: false,
-      mode: s.isDirectory ? 0o755 : 0o644,
+      mode,
       size: s.size ?? 0,
       mtime: new Date(0),
     };

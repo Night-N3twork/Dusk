@@ -30,6 +30,19 @@ export const worldSource = (): Plugin => ({
       platform: 'browser',
       write: false,
       logLevel: 'silent',
+      // Minify the bundled source string. These bundles live as long JS
+      // strings in memory (both in the main-thread module cache and cloned
+      // into every spawned Worker), and every spawn round-trips them
+      // through the IPC pipe. Minifying trims 40-60% off each string with
+      // no runtime behavior change — the SM engine parses the minified
+      // form directly. Whitespace + comments are the biggest win; identifier
+      // mangling is a small further shave.
+      minifyWhitespace: true,
+      minifySyntax: true,
+      // Deliberately NOT mangling identifiers: keeps stack traces readable
+      // for the (frequent) case where a binary throws through world.ts's
+      // error surface. `console.error(...)` shows the real function names.
+      minifyIdentifiers: false,
       define: {
         __DUSK_VERSION__: JSON.stringify(pkg.version),
       },

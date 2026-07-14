@@ -24,13 +24,25 @@ export type HostToWorld =
   | EvalMessage
   | { value?: unknown; ptr?: number };
 
-export const SERIAL_RES_SIZE = 1024 * 1024 * 10;
+// Per-IPC-message ceiling. Sized to fit typical fs.readFile and command
+// responses while keeping RAM cost reasonable (this SAB is allocated once
+// per engine and pinned for the engine's lifetime).
+//
+// Trade-off notes:
+//   - 10MB → wastes RAM idle; only helps for huge single-shot reads.
+//   - 2MB  → too small for a `cat` of a moderate-sized log file.
+//   - 4MB  → fits ~1MB of raw binary (bytes encode as JSON int arrays,
+//            ~4x bloat) and multi-hundred-KB of text.
+// Callers that need bigger payloads must chunk via fd-based read/write,
+// which streams through this same SAB in slices.
+export const SERIAL_RES_SIZE = 1024 * 1024 * 4;
 
 /**
  * Byte payload convention.
  *
  * The SAB envelope is UTF-8 JSON (TextEncoder.encode(JSON.stringify(msg)))
- * with a 10 MB ceiling. There is no transferable / structured-clone path
+ * with a SERIAL_RES_SIZE ceiling (see above). There is no transferable /
+ * structured-clone path
  * (the engine receives messages as text via /comm + readline).
  *
  * To carry raw bytes, a func argument or return slot named `data` (or any

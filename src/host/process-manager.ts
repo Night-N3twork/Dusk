@@ -4,13 +4,14 @@ import { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND } from '
 import { createFDTable, type FDTable } from './fd-table';
 import { norm, dirname } from './vfs';
 import { SERIAL_RES_SIZE } from '../protocol/messages';
-import shellBinarySource from '../shell/binary-entry.ts?worldsrc';
-import nodeBinarySource from '../binaries/node/binary-entry.ts?worldsrc';
 import dshBinarySource from '../binaries/dsh/binary-entry.ts?worldsrc';
-import sqlite3BinarySource from '../binaries/sqlite3/binary-entry.ts?worldsrc';
-import python3BinarySource from '../binaries/python3/binary-entry.ts?worldsrc';
-import { BUILTIN_BINARIES } from './builtin-binaries';
-import { DPM_BUNDLES } from './dpm-binaries';
+// /bin/node, /bin/sh.legacy, /bin/sqlite3, /bin/python3, and the dpm bundle
+// family are only needed when the user (or a script) explicitly invokes them.
+// dsh has its own in-engine `js-exec` and `node` REPL, and dsh's sqlite3/python3
+// custom commands go through host IPC — none of that touches these bundles.
+// We load them lazily on first spawn to keep idle bundle+parsed-JS footprint
+// small. See the registerLazyBinary calls in the constructor.
+import { BUILTIN_BINARIES, JSH_COMMAND_SET } from './builtin-binaries';
 import { createSocketRegistry, type SocketRegistry, type SocketPair } from './socket-registry';
 import { createStreamRegistry, type StreamRegistry } from './stream-registry';
 import { createPtyManager, type PtyManager, type Pty } from './pty';
@@ -315,25 +316,55 @@ export class ProcessManager {
     return t;
   }
 
+  // Optional binaries loaded on first spawn. Keeps ~500KB+ of parsed JS
+  // off the idle heap when the demo/user never invokes these directly.
+  // Note: dsh's built-in `sqlite3` and `python3` commands go through host
+  // IPC and DO NOT need /bin/sqlite3 or /bin/python3 — those bundles are
+  // only needed if the user explicitly invokes /bin/{sqlite3,python3}.
+  private lazyLoaders: Map<string, () => Promise<string>> = new Map();
+
   constructor(fs: FSBackend, netFuncs: FuncTable = {}, extraFuncs: FuncTable = {}) {
     this.fs = fs;
     this.netFuncs = { ...netFuncs, ...extraFuncs };
     // /bin/dsh (Dusk SHell) is the canonical shell. /bin/sh and /bin/jsh
     // are aliases so scripts using shebang `#!/bin/sh` and existing
-    // demos/tests that reference /bin/jsh keep working. shellBinarySource
-    // (the legacy shell v2) is retained under /bin/sh.legacy for now in
-    // case anything explicitly needs it — remove once dsh proves stable.
+    // demos/tests that reference /bin/jsh keep working.
+    //
+    // Only dsh itself is registered eagerly — that's the one binary the demo
+    // spawns on boot. Everything else (node, legacy shell, sqlite3, python3,
+    // dpm family) is loaded on demand from a code-split chunk on first spawn.
+    // Idle bundles stay small; the first invocation pays a one-time fetch.
     this.registerBinary('/bin/dsh', dshBinarySource);
     this.registerBinary('/bin/sh', dshBinarySource);
     this.registerBinary('/bin/jsh', dshBinarySource);
-    this.registerBinary('/bin/sh.legacy', shellBinarySource);
-    this.registerBinary('/bin/node', nodeBinarySource);
-    this.registerBinary('/bin/sqlite3', sqlite3BinarySource);
-    this.registerBinary('/bin/python3', python3BinarySource);
-    this.registerBinary('/bin/python', python3BinarySource);
-    for (const [name, source] of Object.entries(DPM_BUNDLES)) {
-      this.registerBinary(name, source);
-    }
+    // /bin/node — invoked by dsh's `js-exec` fallback, dpm's shebang line,
+    // and any explicit `node <script>` at the shell. The eager `dsh` binary
+    // has its own in-engine node REPL and doesn't rely on this.
+    this.registerLazyBinary('/bin/node', async () =>
+      (await import('../binaries/node/binary-entry.ts?worldsrc')).default);
+    // /bin/sh.legacy — retained "in case anything explicitly needs it".
+    // Nothing in-tree does; loading it costs a Vite dynamic import if
+    // someone actually calls it. Remove entirely once dsh proves stable.
+    this.registerLazyBinary('/bin/sh.legacy', async () =>
+      (await import('../shell/binary-entry.ts?worldsrc')).default);
+    // Lazy: sqlite3, python3, python alias, dpm/dpx/npm/npx/pnpm.
+    // These get their source fetched from a code-split chunk on first spawn.
+    this.registerLazyBinary('/bin/sqlite3', async () =>
+      (await import('../binaries/sqlite3/binary-entry.ts?worldsrc')).default);
+    const loadPython = async (): Promise<string> =>
+      (await import('../binaries/python3/binary-entry.ts?worldsrc')).default;
+    this.registerLazyBinary('/bin/python3', loadPython);
+    this.registerLazyBinary('/bin/python', loadPython);
+    this.registerLazyBinary('/bin/dpm', async () =>
+      (await import('./dpm-bundles/dpm-bundle.js?raw')).default);
+    this.registerLazyBinary('/bin/dpx', async () =>
+      (await import('./dpm-bundles/dpx-bundle.js?raw')).default);
+    this.registerLazyBinary('/bin/npm', async () =>
+      (await import('./dpm-bundles/npm-bundle.js?raw')).default);
+    this.registerLazyBinary('/bin/npx', async () =>
+      (await import('./dpm-bundles/npx-bundle.js?raw')).default);
+    this.registerLazyBinary('/bin/pnpm', async () =>
+      (await import('./dpm-bundles/pnpm-bundle.js?raw')).default);
     for (const [name, src] of Object.entries(BUILTIN_BINARIES)) {
       this.registerBinary(name, src);
     }
@@ -341,6 +372,46 @@ export class ProcessManager {
 
   registerBinary(name: string, jsSource: string): void {
     this.binaries.set(name, jsSource);
+    this.lazyLoaders.delete(name);
+  }
+
+  // Register a binary whose source is fetched on first spawn. Idempotent —
+  // once loaded, the source is cached in this.binaries and subsequent
+  // spawns are synchronous.
+  registerLazyBinary(name: string, loader: () => Promise<string>): void {
+    this.lazyLoaders.set(name, loader);
+  }
+
+  // JSH-wrapper elision. When someone spawns e.g. `/bin/grep foo bar`, the
+  // registered binary is a stub that itself spawns `/bin/dsh -c 'grep foo bar'`
+  // — costing TWO SpiderMonkey Workers (the wrapper + dsh) for one command.
+  // Since dsh already has all these commands as first-class builtins, we
+  // rewrite the spawn to invoke dsh directly, saving one whole SM worker
+  // (~100MB peak) per invocation.
+  //
+  // Called from spawn() and spawnSync(). Returns the rewritten (cmd, args)
+  // pair, or the original inputs if no rewrite applies.
+  private maybeElideJshWrapper(cmd: string, args: string[]): { cmd: string; args: string[] } {
+    if (!JSH_COMMAND_SET.has(cmd)) return { cmd, args };
+    // POSIX single-quote each arg. `'` becomes `'\''`.
+    const bareName = cmd.slice('/bin/'.length);
+    const quoted = args.map((a) => "'" + a.replace(/'/g, "'\\''") + "'").join(' ');
+    const script = quoted.length > 0 ? bareName + ' ' + quoted : bareName;
+    return { cmd: '/bin/dsh', args: ['-c', script] };
+  }
+
+  // Resolve a binary name to its source, forcing a lazy load if needed.
+  // Returns undefined if the binary isn't registered at all (caller falls
+  // back to reading a script from TFS).
+  private async resolveBinary(name: string): Promise<string | undefined> {
+    const eager = this.binaries.get(name);
+    if (eager !== undefined) return eager;
+    const loader = this.lazyLoaders.get(name);
+    if (!loader) return undefined;
+    const source = await loader();
+    this.binaries.set(name, source);
+    this.lazyLoaders.delete(name);
+    return source;
   }
 
   getProcess(pid: number): DuskProcessHandle | undefined {
@@ -352,14 +423,21 @@ export class ProcessManager {
   }
 
   listBinaries(): string[] {
-    return [...this.binaries.keys()].sort();
+    // Include both eagerly-loaded and lazily-registered names so consumers
+    // (which command completion, PATH search) see the full set even before
+    // the lazy sources have been fetched.
+    const names = new Set<string>([...this.binaries.keys(), ...this.lazyLoaders.keys()]);
+    return [...names].sort();
   }
 
   hasBinary(name: string): boolean {
-    return this.binaries.has(name);
+    return this.binaries.has(name) || this.lazyLoaders.has(name);
   }
 
   getBinarySource(name: string): string | undefined {
+    // Sync accessor — returns undefined for lazy binaries that haven't
+    // been forced yet. Callers that need the source should go through
+    // spawn/spawnSync (which awaits resolveBinary internally).
     return this.binaries.get(name);
   }
 
@@ -546,6 +624,9 @@ export class ProcessManager {
   }
 
   async spawn(cmd: string, args: string[] = [], options: SpawnOptions = {}): Promise<DuskProcessHandle> {
+    // Fold JSH-wrapper spawns into a direct dsh -c invocation before we
+    // allocate a pid or a worker. See maybeElideJshWrapper for rationale.
+    ({ cmd, args } = this.maybeElideJshWrapper(cmd, args));
     const pid = this.nextPid++;
     const stdinBytes = normalizeStdin(options.stdin);
 
@@ -736,6 +817,7 @@ export class ProcessManager {
   }
 
   async spawnSync(cmd: string, args: string[] = [], options: SpawnOptions = {}): Promise<SpawnSyncResult> {
+    ({ cmd, args } = this.maybeElideJshWrapper(cmd, args));
     const pid = this.nextPid++;
     const stdoutChunks: Uint8Array[] = [];
     const stderrChunks: Uint8Array[] = [];
@@ -1792,7 +1874,7 @@ export class ProcessManager {
       `process.env = ${JSON.stringify(env)};\n` +
       `process.chdir(${JSON.stringify(cwd)});\n`;
 
-    const builtin = this.binaries.get(cmd);
+    const builtin = await this.resolveBinary(cmd);
     let body: string;
     if (builtin !== undefined) {
       body = builtin;

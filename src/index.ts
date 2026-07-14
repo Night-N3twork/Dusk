@@ -30,11 +30,21 @@ export interface BootReplOptions {
    *   and the child's stdout/stderr are decoded and forwarded to `write`.
    */
   via?: 'startRepl' | 'node';
+  /**
+   * Skip creating the pid-0 engine entirely. Saves ~100MB of RAM (a full
+   * SpiderMonkey Worker) for callers that never use `feed()` and only spawn
+   * child processes via `processManager.spawn(...)`. When set:
+   *   - `.feed()` becomes a no-op that logs a warning
+   *   - `.engine` is a lightweight stub that only implements `.terminate()`
+   * Demo pages that spawn `/bin/dsh` interactively should set this.
+   * Default: false (creates pid-0 for backwards compat).
+   */
+  skipPidZero?: boolean;
 }
 
 export interface BootReplResult extends DuskRepl {
   processManager: ProcessManager;
-  /** pid-0 engine. Kept for backwards compat (tests call `repl.engine.terminate()`). */
+  /** pid-0 engine. Present unless `skipPidZero: true`, in which case it's a stub. */
   engine: EngineInstance;
   /** Present when `via: 'node'` — the spawned /bin/node child handle. */
   node?: DuskProcessHandle;
@@ -105,8 +115,31 @@ export const bootRepl = async (
     await backend.writeFile(path, contents);
   }
 
-  const engine = await pm.createPidZero(netFuncs, write, { user, hostname });
-  engineHolder.engine = engine;
+  // Optionally skip pid-0 — saves ~100MB of RAM by not spawning an entire
+  // SpiderMonkey Worker for the `feed()` path. Only meaningful for callers
+  // that will never call `.feed()` and only use `processManager.spawn(...)`.
+  let engine: EngineInstance;
+  if (options?.skipPidZero) {
+    // Lightweight stub: satisfies .engine.terminate() from tests and demo,
+    // ignores everything else. Any actual dispatch attempt will throw.
+    let terminated = false;
+    engine = {
+      pid: 0,
+      run: async (): Promise<void> => {
+        throw new Error('bootRepl: pid-0 engine skipped (skipPidZero:true); use processManager.spawn instead');
+      },
+      dispatch: (): void => {
+        throw new Error('bootRepl: pid-0 engine skipped (skipPidZero:true)');
+      },
+      terminate: async (): Promise<number> => { terminated = true; return 0; },
+      get exited(): Promise<number> {
+        return terminated ? Promise.resolve(0) : new Promise<number>(() => {});
+      },
+    };
+  } else {
+    engine = await pm.createPidZero(netFuncs, write, { user, hostname });
+    engineHolder.engine = engine;
+  }
 
   if (options?.via === 'node') {
     // Spawn /bin/node with no args → enters REPL mode. No PTY: readline goes via
@@ -140,19 +173,15 @@ export const bootRepl = async (
     return { feed, processManager: pm, engine, node: nodeHandle };
   }
 
+  if (options?.skipPidZero) {
+    // No pid-0 → no startRepl. Provide a feed() that clearly errors so
+    // misuse surfaces immediately rather than silently no-oping.
+    const feed = async (): Promise<void> => {
+      throw new Error('bootRepl: feed() unavailable when skipPidZero:true. Spawn a shell via processManager.spawn(\'/bin/dsh\', ...) and write to its stdin.');
+    };
+    return { feed, processManager: pm, engine };
+  }
+
   const repl = startRepl(engine, write);
   return { feed: repl.feed, processManager: pm, engine };
 };
-
-if (typeof document !== 'undefined' && import.meta.env?.MODE !== 'test') {
-  void (async () => {
-    const params = new URLSearchParams(location.search);
-    if (params.get('demo') === 'scripted') {
-      const { startScripted } = await import('./demo/scripted');
-      await startScripted();
-    } else {
-      const { startPage } = await import('./demo/page');
-      await startPage();
-    }
-  })();
-}

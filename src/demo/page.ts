@@ -89,6 +89,76 @@ const SQLITE_EXAMPLES: string[] = [
   'echo "SELECT sqlite_version()" | sqlite3 :memory:',
 ];
 
+// node:crypto examples for the Node REPL. Run `node` first to enter the
+// REPL, then click these. Each entry is a single line — the DuskJS node
+// REPL persists BARE assignments across lines (e.g. `x = 1`) but NOT
+// `const`/`let`/`function`, so every declaration below is a bare assign
+// on top of `globalThis`. Semicolons chain steps within a single click.
+//
+// Coverage matches the node:crypto compatibility surface documented in
+// src/world/node-crypto.ts:
+//   - Hashes MD5/SHA-1/SHA-256/SHA-512 (SHA-2 via host WebCrypto IPC)
+//   - HMAC (all sha variants)
+//   - PBKDF2 sync + async (host IPC)
+//   - AES-256-CBC, AES-128-CTR, AES-256-GCM round-trips
+//   - RSA-2048 keypair gen + sign/verify (real WebCrypto; ~2-5s to gen)
+//   - EC P-256 keypair + ECDSA sign/verify
+//   - randomBytes / randomUUID / randomInt / timingSafeEqual
+//   - webcrypto passthrough
+// Deliberately excluded: scrypt (faked via PBKDF2 in DuskJS —
+// output != Node), createSecretKey/KeyObject (absent), ECDH,
+// publicEncrypt/privateDecrypt (see node-crypto.ts).
+const CRYPTO_EXAMPLES: string[] = [
+  // ─── Randomness ────────────────────────────────────────────────
+  "require('crypto').randomBytes(16).toString('hex')",
+  "require('crypto').randomUUID()",
+  "require('crypto').randomInt(1, 100)",
+  "c = require('crypto'); Array.from({length: 5}, () => c.randomInt(0, 10))",
+  // ─── Hashing ───────────────────────────────────────────────────
+  "require('crypto').createHash('md5').update('hello').digest('hex')",
+  "require('crypto').createHash('sha1').update('hello world').digest('hex')",
+  "require('crypto').createHash('sha256').update('the quick brown fox').digest('hex')",
+  "require('crypto').createHash('sha512').update('duskjs').digest('base64')",
+  "h = require('crypto').createHash('sha256'); h.update('one'); h.update('two'); h.update('three'); h.digest('hex')",
+  "c = require('crypto'); s = 'password123'; ({md5: c.createHash('md5').update(s).digest('hex'), sha1: c.createHash('sha1').update(s).digest('hex'), sha256: c.createHash('sha256').update(s).digest('hex')})",
+  // ─── HMAC ──────────────────────────────────────────────────────
+  "require('crypto').createHmac('sha256', 'secret-key').update('message').digest('hex')",
+  "require('crypto').createHmac('sha512', 'k').update('m').digest('base64')",
+  "c = require('crypto'); key = 'shhh'; msg = 'attack at dawn'; sig1 = c.createHmac('sha256', key).update(msg).digest('hex'); check = c.createHmac('sha256', key).update(msg).digest('hex'); ({sig1, check, ok: sig1 === check})",
+  // ─── Timing-safe compare ───────────────────────────────────────
+  "c = require('crypto'); c.timingSafeEqual(Buffer.from('secret'), Buffer.from('secret'))",
+  "c = require('crypto'); c.timingSafeEqual(Buffer.from('abc'), Buffer.from('abd'))",
+  // ─── PBKDF2 (host IPC) ─────────────────────────────────────────
+  "require('crypto').pbkdf2Sync('mypassword', 'salt', 1000, 32, 'sha256').toString('hex')",
+  "require('crypto').pbkdf2('pw', 'salt-value', 10000, 64, 'sha512', (e, k) => console.log(k.toString('hex')))",
+  "require('crypto').pbkdf2Sync('correct horse battery staple', 'unique-salt', 100000, 32, 'sha256').toString('hex')",
+  // ─── AES-256-CBC round-trip ────────────────────────────────────
+  "c = require('crypto'); cbcKey = c.randomBytes(32); cbcIv = c.randomBytes(16); cbcCipher = c.createCipheriv('aes-256-cbc', cbcKey, cbcIv); cbcEnc = Buffer.concat([cbcCipher.update('hello world', 'utf8'), cbcCipher.final()]); cbcDec = c.createDecipheriv('aes-256-cbc', cbcKey, cbcIv); cbcOut = Buffer.concat([cbcDec.update(cbcEnc), cbcDec.final()]).toString('utf8'); ({encHex: cbcEnc.toString('hex'), plain: cbcOut})",
+  // ─── AES-128-CTR round-trip ────────────────────────────────────
+  "c = require('crypto'); ctrKey = c.randomBytes(16); ctrIv = c.randomBytes(16); ctrE = c.createCipheriv('aes-128-ctr', ctrKey, ctrIv); ctrCt = Buffer.concat([ctrE.update('streaming data'), ctrE.final()]); ctrD = c.createDecipheriv('aes-128-ctr', ctrKey, ctrIv); Buffer.concat([ctrD.update(ctrCt), ctrD.final()]).toString()",
+  // ─── AES-256-GCM (authenticated) ───────────────────────────────
+  "c = require('crypto'); gcmKey = c.randomBytes(32); gcmIv = c.randomBytes(12); gcmCipher = c.createCipheriv('aes-256-gcm', gcmKey, gcmIv); gcmCt = Buffer.concat([gcmCipher.update('sensitive'), gcmCipher.final()]); gcmTag = gcmCipher.getAuthTag(); gcmDec = c.createDecipheriv('aes-256-gcm', gcmKey, gcmIv); gcmDec.setAuthTag(gcmTag); Buffer.concat([gcmDec.update(gcmCt), gcmDec.final()]).toString()",
+  // ─── RSA-2048 keypair + sign/verify (real WebCrypto — ~2-5s) ───
+  "kp = require('crypto').generateKeyPairSync('rsa', {modulusLength: 2048, publicKeyEncoding: {type:'spki',format:'pem'}, privateKeyEncoding: {type:'pkcs8',format:'pem'}}); kp.publicKey.slice(0, 80)",
+  "rsaSig = require('crypto').createSign('sha256').update('important message').sign(kp.privateKey); rsaSig.toString('base64').slice(0, 60) + '...'",
+  "require('crypto').createVerify('sha256').update('important message').verify(kp.publicKey, rsaSig)",
+  "require('crypto').createVerify('sha256').update('important message TAMPERED').verify(kp.publicKey, rsaSig)",
+  // ─── EC P-256 keypair + ECDSA sign/verify ──────────────────────
+  "ec = require('crypto').generateKeyPairSync('ec', {namedCurve: 'P-256', publicKeyEncoding: {type:'spki',format:'pem'}, privateKeyEncoding: {type:'pkcs8',format:'pem'}}); ec.publicKey.slice(0, 80)",
+  "ecSig = require('crypto').createSign('sha256').update('signed with EC').sign(ec.privateKey); require('crypto').createVerify('sha256').update('signed with EC').verify(ec.publicKey, ecSig)",
+  // ─── Discovery ─────────────────────────────────────────────────
+  "require('crypto').getHashes()",
+  "require('crypto').getCiphers()",
+  // ─── WebCrypto passthrough ─────────────────────────────────────
+  "w = require('crypto').webcrypto; w.getRandomValues(new Uint8Array(8))",
+  "w = require('crypto').webcrypto; wcBuf = await w.subtle.digest('SHA-256', new TextEncoder().encode('hi')); Buffer.from(wcBuf).toString('hex')",
+  // ─── Encrypted vault (2-step; click in order) ──────────────────
+  // Step 1: encrypt into `stored`
+  "c = require('crypto'); vPw = 'user-master-password'; vSalt = c.randomBytes(16); vIv = c.randomBytes(12); vKey = c.pbkdf2Sync(vPw, vSalt, 100000, 32, 'sha256'); vCipher = c.createCipheriv('aes-256-gcm', vKey, vIv); vCt = Buffer.concat([vCipher.update('my-github-token-abc123', 'utf8'), vCipher.final()]); vTag = vCipher.getAuthTag(); stored = { salt: vSalt.toString('base64'), iv: vIv.toString('base64'), ct: vCt.toString('base64'), tag: vTag.toString('base64') }; stored",
+  // Step 2: decrypt using the `stored` bundle from step 1
+  "c = require('crypto'); dSalt = Buffer.from(stored.salt, 'base64'); dIv = Buffer.from(stored.iv, 'base64'); dTag = Buffer.from(stored.tag, 'base64'); dKey = c.pbkdf2Sync('user-master-password', dSalt, 100000, 32, 'sha256'); dDec = c.createDecipheriv('aes-256-gcm', dKey, dIv); dDec.setAuthTag(dTag); Buffer.concat([dDec.update(Buffer.from(stored.ct, 'base64')), dDec.final()]).toString('utf8')",
+];
+
 // python3 (dsh built-in via Pyodide on the host). First call downloads
 // Pyodide from CDN (~10MB) and stalls for a few seconds — subsequent calls
 // are fast because the interpreter is cached.
@@ -121,6 +191,7 @@ export const startPage = async (): Promise<void> => {
   const line = document.getElementById('line') as HTMLInputElement;
   const examples = document.getElementById('examples') as HTMLDivElement;
   const nodeExamples = document.getElementById('node-examples') as HTMLDivElement;
+  const cryptoExamples = document.getElementById('crypto-examples') as HTMLDivElement;
   const sqliteExamples = document.getElementById('sqlite-examples') as HTMLDivElement;
   const pythonExamples = document.getElementById('python-examples') as HTMLDivElement;
   const fsview = document.getElementById('fsview') as HTMLPreElement;
@@ -142,6 +213,11 @@ export const startPage = async (): Promise<void> => {
   const repl = await bootRepl(write, {
     net: { loadLibcurl: loadRealLibcurl, proxyUrl: 'wss://gointospace.app/wisp/' },
     seed: TRANSCRIPT_SEED,
+    // The demo drives dsh directly via stdin (no `feed()` calls), so the
+    // pid-0 engine that bootRepl would otherwise create is dead weight —
+    // it's a whole SpiderMonkey Worker (~100MB) that just sits idle.
+    // Skipping it roughly halves the demo's steady-state memory footprint.
+    skipPidZero: true,
   });
   write('spawning /bin/dsh (interactive)...\n');
   const sh = await repl.processManager.spawn('/bin/dsh', [], {
@@ -208,6 +284,18 @@ export const startPage = async (): Promise<void> => {
     // and the label above the section explains the ordering.
     btn.addEventListener('click', () => { void submit(ex); });
     nodeExamples.appendChild(btn);
+  }
+  // Crypto examples run inside the Node REPL (same as NODE_EXAMPLES).
+  // Buttons show truncated labels so long snippets are readable; the full
+  // command is still what gets submitted. Hover to see the whole thing.
+  for (const ex of CRYPTO_EXAMPLES) {
+    const btn = document.createElement('button');
+    // Truncate very long lines in the label but preserve the full command
+    // in title (hover tooltip) and click handler.
+    btn.textContent = ex.length > 72 ? ex.slice(0, 69) + '...' : ex;
+    btn.title = ex;
+    btn.addEventListener('click', () => { void submit(ex); });
+    cryptoExamples.appendChild(btn);
   }
   for (const ex of SQLITE_EXAMPLES) {
     const btn = document.createElement('button');
