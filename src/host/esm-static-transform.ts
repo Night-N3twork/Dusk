@@ -110,3 +110,33 @@ export const transformStaticImports = async (source: string): Promise<string> =>
   if (!result?.code) throw new Error('Unable to compile ESM module');
   return `${result.code}\nglobalThis.__duskSystemMetadata = ${JSON.stringify(metadataFor(ast as unknown as SyntaxNode))};`;
 };
+
+const importMetaPlugin = ({ types }: { types: { identifier(name: string): unknown } }) => ({
+  visitor: {
+    MetaProperty(path: { node: { meta: { name: string }; property: { name: string } }; replaceWith(node: unknown): void }) {
+      if (path.node.meta.name === 'import' && path.node.property.name === 'meta') path.replaceWith(types.identifier('__duskImportMeta'));
+    },
+  },
+});
+
+export const transformEsmToCommonJs = async (source: string, path: string): Promise<string> => {
+  const Babel = await loadBabel();
+  const parsed = Babel.transform(source, { ast: true, code: false, sourceType: 'module' });
+  if (!parsed.ast) throw new Error('Unable to parse ESM module');
+  if (hasTopLevelAwait((parsed.ast as unknown as SyntaxNode)['program'] as SyntaxNode)) {
+    throw new Error(`ERR_REQUIRE_ASYNC_MODULE: require() cannot be used on an ESM graph with top-level await. Use import() instead. From ${path}`);
+  }
+  const result = Babel.transform(source, {
+    sourceType: 'module',
+    plugins: [importMetaPlugin, ['transform-modules-commonjs', { importInterop: 'node' }]],
+  });
+  if (!result?.code) throw new Error('Unable to compile ESM module');
+  return result.code;
+};
+
+export const prepareModuleSource = async (source: string, path: string, mode: unknown): Promise<string> => {
+  if (path.endsWith('.json')) return source;
+  if (mode === 'import') return transformStaticImports(source);
+  if (mode === 'require-esm') return transformEsmToCommonJs(source, path);
+  return source;
+};

@@ -20,7 +20,7 @@ export default defineConfig({
   },
   plugins: [nativeWorkerWithoutHmr(), worldSource()],
   worker: { format: 'es' },
-  optimizeDeps: { include: ['@wasmer/wasi', '@wasmer/wasi/lib/bindings/browser', '@wasmer/wasmfs', 'buffer', '@terbiumos/tfs/browser'], exclude: ['libcurl.js', '@nightnetwork/nova'] },
+  optimizeDeps: { include: ['@wasmer/wasi', '@wasmer/wasi/lib/bindings/browser', '@wasmer/wasmfs', 'buffer', '@terbiumos/tfs/browser'], exclude: ['@nightnetwork/nova'] },
   define: {
     __DUSK_VERSION__: JSON.stringify(pkg.version),
   },

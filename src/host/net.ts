@@ -1,4 +1,5 @@
 import type { FuncTable, SendFn } from './runner';
+import { assertAllowed, assertUrlAllowed, type NetworkPolicy } from './network-policy';
 
 export interface NetResponse {
   status: number;
@@ -40,6 +41,7 @@ export const createNet = (
   loadLibcurl: () => Promise<LibCurl>,
   dispatch: (js: string, pid?: number) => void,
   proxyUrl: string,
+  policy?: NetworkPolicy,
 ): NetHost => {
   const instances = new Map<string, LibCurl>();
   const directWebsockets = new Map<LibCurl, string>();
@@ -125,6 +127,7 @@ export const createNet = (
       send({ value: id });
       void (async () => {
         try {
+          assertUrlAllowed(policy, m['url'] as string);
           const c = await ensureActive();
           const res = await c.fetch(m['url'] as string, m['opts']);
           if (fetches.get(id) === pid) fire(id, 'response', await responsePayload(res), pid);
@@ -135,6 +138,7 @@ export const createNet = (
     'net.fetch.sync': (m, send: SendFn) => {
       void (async () => {
         try {
+          assertUrlAllowed(policy, m['url'] as string);
           const c = await ensureActive();
           const res = await c.fetch(m['url'] as string, m['opts']);
           send({ value: await responsePayload(res) });
@@ -148,6 +152,7 @@ export const createNet = (
       void (async () => {
         try {
           const c = await ensureActive();
+          assertUrlAllowed(policy, m['url'] as string);
           const ws = new c.WebSocket(m['url'] as string, (m['protocols'] as string[]) ?? []);
           if (pid !== undefined && exitedPids.has(pid)) {
             try { ws.close(); } catch { /* best-effort shutdown */ }
@@ -282,6 +287,7 @@ export const createNet = (
           record = sessions.get(m['sid'] as number);
           if (!record) { fire(id, 'error', 'unknown session: ' + m['sid'], pid); return; }
           if (!owns(record, pid)) { fire(id, 'error', 'resource belongs to another process', pid); return; }
+          assertUrlAllowed(policy, m['url'] as string);
           const res = await record.session.fetch(m['url'] as string, m['opts']);
           const payload = await responsePayload(res);
           if (sessions.get(m['sid'] as number) === record) fire(id, 'response', payload, record.pid);
@@ -306,6 +312,7 @@ export const createNet = (
         try {
           const c = await ensureActive();
           if (!c.TLSSocket) { fire(id, 'error', 'TLSSocket not supported by active instance', pid); return; }
+          assertAllowed(policy, { protocol: 'tls:', host: String(m['host']).toLowerCase(), port: m['port'] as number });
           const sock = new c.TLSSocket(m['host'] as string, m['port'] as number, m['opts']);
           if (pid !== undefined && exitedPids.has(pid)) {
             try { sock.close(); } catch { /* best-effort shutdown */ }
@@ -346,10 +353,12 @@ export const createNet = (
 
   return {
     fetch: async (url) => {
+      assertUrlAllowed(policy, url);
       const response = await (await ensureActive()).fetch(url);
       return { status: response.status, statusText: response.statusText, headers: Object.fromEntries(response.headers.entries()), body: await response.text() };
     },
     fetchBytes: async (url) => {
+      assertUrlAllowed(policy, url);
       const response = await (await ensureActive()).fetch(url);
       return new Uint8Array(await response.arrayBuffer());
     },

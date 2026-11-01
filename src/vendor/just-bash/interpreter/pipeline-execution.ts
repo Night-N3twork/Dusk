@@ -15,7 +15,7 @@ import { _performanceNow } from "../security/trusted-globals.js";
 import type { ExecResult } from "../types.js";
 import { BadSubstitutionError, ErrexitError, ExitError } from "./errors.js";
 import { OK } from "./helpers/result.js";
-import type { InterpreterContext } from "./types.js";
+import { captureOutput, type InterpreterContext } from "./types.js";
 
 /**
  * Type for executeCommand callback
@@ -32,6 +32,19 @@ export async function executePipeline(
   ctx: InterpreterContext,
   node: PipelineNode,
   executeCommand: ExecuteCommandFn,
+): Promise<ExecResult> {
+  const live = !!ctx.onOutput && (ctx.captureDepth ?? 0) === 0;
+  if (ctx.onOutput && node.commands.length > 1) {
+    return captureOutput(ctx, () => executePipelineInner(ctx, node, executeCommand, live));
+  }
+  return executePipelineInner(ctx, node, executeCommand, live);
+}
+
+async function executePipelineInner(
+  ctx: InterpreterContext,
+  node: PipelineNode,
+  executeCommand: ExecuteCommandFn,
+  live = false,
 ): Promise<ExecResult> {
   // Record start time for timed pipelines
   const startTime = node.timed ? _performanceNow() : 0;
@@ -79,6 +92,8 @@ export async function executePipeline(
     const savedEnv = runsInSubshell ? new Map(ctx.state.env) : null;
 
     let result: ExecResult;
+    const savedTerminalDepth = ctx.terminalDepth;
+    ctx.terminalDepth = isLast && live ? (ctx.captureDepth ?? 0) : undefined;
     try {
       result = await executeCommand(command, stdin);
     } catch (error) {
@@ -114,6 +129,8 @@ export async function executePipeline(
         }
         throw error;
       }
+    } finally {
+      ctx.terminalDepth = savedTerminalDepth;
     }
 
     // Restore environment for subshell commands to prevent variable assignment leakage

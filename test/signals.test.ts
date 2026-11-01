@@ -203,7 +203,7 @@ test('SIGPIPE default action terminates a producer whose stream consumer closed'
   expect(consumerSawChunks).toBeGreaterThan(0);
 }, 60_000);
 
-// Un-skipped by plan 5 Task 3: uses SpawnOptions.pty to attach a PTY and
+// Uses SpawnOptions.pty to attach a PTY and
 // ProcessManager.resizePty to fire SIGWINCH with { cols, rows } payload.
 test('PTY resize delivers SIGWINCH with new cols/rows', async () => {
   const pm = new ProcessManager(createMemoryBackend());

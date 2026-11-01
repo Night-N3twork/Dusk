@@ -48,11 +48,16 @@
     "prepublishOnly": "npm run verify:release"
   },
   "dependencies": {
-    "@babel/standalone": "^8.0.4",
     "@nightnetwork/dpm": "1.0.0",
     "@nightnetwork/moonbeam": "^1.1.1",
-    "@nightnetwork/nova": "^1.1.0",
+    "@nightnetwork/nova": "^1.1.0"
+  },
+  "devDependencies": {
+    "@babel/standalone": "^8.0.4",
     "@terbiumos/tfs": "^1.0.24",
+    "@types/node": "^24.10.1",
+    "@vitest/browser": "^4.1.11",
+    "@vitest/browser-playwright": "^4.1.11",
     "@wasmer/wasi": "^0.12.0",
     "@wasmer/wasmfs": "^0.12.0",
     "@xterm/addon-fit": "^0.11.0",
@@ -61,23 +66,18 @@
     "fast-xml-parser": "^5.10.1",
     "file-type": "^22.0.1",
     "ini": "^7.0.0",
-    "libcurl.js": "0.7.4",
+    "isomorphic-git": "^1.44.2",
     "minimatch": "^10.2.6",
     "papaparse": "^5.5.4",
+    "playwright": "^1.49.0",
     "pyodide": "^314.0.2",
     "re2js": "^2.8.5",
     "smol-toml": "^1.9.0",
     "sprintf-js": "^1.1.3",
     "systemjs": "^6.15.1",
-    "yaml": "^2.9.0"
-  },
-  "devDependencies": {
-    "@vitest/browser": "^4.1.11",
-    "@vitest/browser-playwright": "^4.1.11",
-    "playwright": "^1.49.0",
-    "@types/node": "^24.10.1",
     "typescript": "^5.6.0",
     "vite": "^6.0.0",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "yaml": "^2.9.0"
   }
 }

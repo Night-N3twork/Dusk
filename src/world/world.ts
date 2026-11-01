@@ -3,6 +3,7 @@ import { installNodeGlobals } from './node-globals';
 import { installRequire } from './require';
 import { installESM } from './esm';
 import { installNet } from './net';
+import { bytesAsArrays } from '../protocol/frame';
 
 {
   const g = globalThis as Record<string, unknown>;
@@ -125,7 +126,7 @@ import { installNet } from './net';
         const bytes = bytesFrom(data);
         const result = cryptoCall('crypto.digest', {
           algorithm: algo,
-          data: Array.from(bytes),
+          data: bytes,
         }) as number[];
         return Uint8Array.from(result).buffer;
       },
@@ -137,8 +138,8 @@ import { installNet } from './net';
         const hashAlgo = typeof key.algo.hash === 'string' ? key.algo.hash : key.algo.hash?.name ?? 'SHA-256';
         const result = cryptoCall('crypto.hmac', {
           algorithm: hashAlgo,
-          key: Array.from(key._raw),
-          data: Array.from(bytes),
+          key: key._raw,
+          data: bytes,
         }) as number[];
         void algorithm;
         return Uint8Array.from(result).buffer;
@@ -259,20 +260,22 @@ import { installNet } from './net';
 }
 
 const isNativeWorker = (globalThis as Record<string, unknown>)['__DUSK_NATIVE_WORKER__'] === true;
+const hostEval = globalThis.eval;
 
 if (typeof (globalThis as { ipc?: unknown }).ipc === 'undefined') {
   if (isNativeWorker) {
+    const nativeSend = (globalThis as Record<string, unknown>)['__duskIpcSend'] as ((msg: unknown) => unknown) | undefined;
     (globalThis as Record<string, unknown>).ipc = {
-      send: (msg: unknown) => {
-        print(JSON.stringify(msg));
+      send: nativeSend ?? ((msg: unknown) => {
+        print(JSON.stringify(msg, bytesAsArrays));
         return JSON.parse(os.file.readFile('/comm'));
-      },
+      }),
     };
   } else {
   (globalThis as Record<string, unknown>).evalQueue = [];
   (globalThis as Record<string, unknown>).ipc = {
     send: (msg: unknown, ignoreEval = true) => {
-      print(JSON.stringify(msg));
+      print(JSON.stringify(msg, bytesAsArrays));
       return (globalThis as { ipc: { recv: (i: boolean) => unknown } }).ipc.recv(ignoreEval);
     },
     recv: (ignoreEval: boolean) => {
@@ -314,27 +317,41 @@ if (!worldGlobal['__process']) {
 interface DuskLifecycle {
   retain(): () => void;
   whenIdle(): Promise<void>;
+  active(): number;
+  whenAtMost(count: number): Promise<void>;
 }
 
 const processRecord = worldGlobal['__process'] as Record<string, unknown>;
 if (isNativeWorker && !processRecord['__duskLifecycle']) {
   let count = 0;
-  let idle = Promise.resolve();
-  let resolveIdle: (() => void) | undefined;
+  const waiters: Array<{ limit: number; resolve: () => void }> = [];
+  const settle = (): void => {
+    for (let i = waiters.length - 1; i >= 0; i--) {
+      const waiter = waiters[i]!;
+      if (count <= waiter.limit) {
+        waiters.splice(i, 1);
+        waiter.resolve();
+      }
+    }
+  };
+  const whenAtMost = (limit: number): Promise<void> => {
+    if (count <= limit) return Promise.resolve();
+    return new Promise<void>((resolve) => { waiters.push({ limit, resolve }); });
+  };
   const lifecycle: DuskLifecycle = {
     retain: (): (() => void) => {
-      if (count++ === 0) idle = new Promise<void>((resolve) => { resolveIdle = resolve; });
+      count++;
       let released = false;
       return (): void => {
         if (released) return;
         released = true;
-        if (--count === 0) {
-          resolveIdle?.();
-          resolveIdle = undefined;
-        }
+        count--;
+        settle();
       };
     },
-    whenIdle: (): Promise<void> => idle,
+    whenIdle: (): Promise<void> => whenAtMost(0),
+    active: (): number => count,
+    whenAtMost,
   };
   processRecord['__duskLifecycle'] = lifecycle;
 }
@@ -415,7 +432,7 @@ if (isNativeWorker) {
 
   const execute = async ({ js, primary }: { js: string; primary: boolean }): Promise<void> => {
     try {
-      await (0, eval)('(async () => {' + js.replace(/\bimport\s*\(/g, '__import__(') + '\n})()');
+      await hostEval('(async () => {' + js.replace(/\bimport\s*\(/g, '__import__(') + '\n})()');
     } catch (e) {
       print(JSON.stringify({ f: 'console.error', args: [String(e)] }));
     }
@@ -452,7 +469,7 @@ if (isNativeWorker) {
   while (true) {
     const reply = ipc.send({ type: 'wait' }, false);
     const js = (reply.js ?? '').replace(/\bimport\s*\(/g, '__import__(');
-    try { (0, eval)('(async () => {' + js + '\n})()'); if (typeof drainJobQueue === 'function') drainJobQueue(); } catch (e) { print(JSON.stringify({ f: 'console.error', args: [String(e)] })); }
+    try { hostEval('(async () => {' + js + '\n})()'); if (typeof drainJobQueue === 'function') drainJobQueue(); } catch (e) { print(JSON.stringify({ f: 'console.error', args: [String(e)] })); }
     const proc = (globalThis as Record<string, unknown>)['__process'] as { _exitCode?: number } | undefined;
     if (proc?._exitCode !== undefined) {
       ipc.send({ type: 'exit', exitCode: proc._exitCode });

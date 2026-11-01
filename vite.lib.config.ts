@@ -17,6 +17,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // from `dist/`.
 export default defineConfig({
   base: './',
+  publicDir: false,
   plugins: [worldSource()],
   worker: { format: 'es' },
   define: {

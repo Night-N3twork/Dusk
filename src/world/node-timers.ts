@@ -41,9 +41,26 @@ export const nodeTimers = {
 };
 
 // node:timers/promises
-const promisesSetTimeout = (ms: number, value?: unknown, _opts?: { signal?: AbortSignal; ref?: boolean }): Promise<unknown> => {
-  return new Promise((resolve) => {
-    _setTimeout(() => resolve(value), ms);
+const abortError = (signal: AbortSignal): Error => {
+  const error = new Error('The operation was aborted', { cause: signal.reason });
+  error.name = 'AbortError';
+  (error as Error & { code?: string }).code = 'ABORT_ERR';
+  return error;
+};
+
+const promisesSetTimeout = (ms: number, value?: unknown, opts?: { signal?: AbortSignal; ref?: boolean }): Promise<unknown> => {
+  const signal = opts?.signal;
+  if (signal?.aborted) return Promise.reject(abortError(signal));
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      _clearTimeout(timer);
+      reject(abortError(signal!));
+    };
+    const timer = _setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve(value);
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 };
 
@@ -64,3 +81,4 @@ export const nodeTimersPromises = {
   setImmediate: promisesSetImmediate,
   setInterval: promisesSetInterval,
 };
+(nodeTimers as Record<string, unknown>)['promises'] = nodeTimersPromises;

@@ -88,10 +88,6 @@ export type CommandName =
   | "tac"
   | "hostname"
   | "od"
-  | "gzip"
-  | "gunzip"
-  | "zcat"
-  | "tar"
   | "yq"
   | "xan"
   | "sqlite3"
@@ -457,30 +453,12 @@ const commandLoaders: LazyCommandDef<CommandName>[] = [
     name: "od",
     load: async () => (await import("./od/od.js")).od,
   },
-
-  // Compression
-  {
-    name: "gzip",
-    load: async () => (await import("./gzip/gzip.js")).gzipCommand,
-  },
-  {
-    name: "gunzip",
-    load: async () => (await import("./gzip/gzip.js")).gunzipCommand,
-  },
-  {
-    name: "zcat",
-    load: async () => (await import("./gzip/gzip.js")).zcatCommand,
-  },
 ];
 
 // tar, yq, xan, and sqlite3 don't work in browsers
 // __BROWSER__ is defined by esbuild at build time for browser bundles
 declare const __BROWSER__: boolean | undefined;
 if (typeof __BROWSER__ === "undefined" || !__BROWSER__) {
-  commandLoaders.push({
-    name: "tar" as CommandName,
-    load: async () => (await import("./tar/tar.js")).tarCommand,
-  });
   commandLoaders.push({
     name: "yq" as CommandName,
     load: async () => (await import("./yq/yq.js")).yqCommand,

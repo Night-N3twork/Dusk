@@ -111,12 +111,12 @@ export class Socket extends Duplex {
       allowHalfOpen: opts.allowHalfOpen ?? false,
       write: (chunk, _enc, cb) => {
         if (this.readyState === 'closed') { cb(codes.ERR_SOCKET_CLOSED!()); return; }
-        let bytes: number[];
-        if (chunk instanceof Uint8Array) bytes = Array.from(chunk);
+        let bytes: Uint8Array;
+        if (chunk instanceof Uint8Array) bytes = chunk;
         else if (typeof chunk === 'string') {
-          bytes = [];
-          for (let i = 0; i < (chunk as string).length; i++) bytes.push((chunk as string).charCodeAt(i));
-        } else if (Array.isArray(chunk)) bytes = chunk as number[];
+          const BufferCtor = (globalThis as Record<string, unknown>)['Buffer'] as { from(s: string, e?: string): Uint8Array } | undefined;
+          bytes = BufferCtor ? BufferCtor.from(chunk, typeof _enc === 'string' && _enc !== 'buffer' ? _enc : 'utf8') : new TextEncoder().encode(chunk);
+        } else if (Array.isArray(chunk)) bytes = Uint8Array.from(chunk as number[]);
         else { cb(codes.ERR_INVALID_ARG_TYPE!('chunk', ['string', 'Uint8Array'], chunk)); return; }
         try {
           __call('net.send', { socketId: this._socketId, data: bytes });

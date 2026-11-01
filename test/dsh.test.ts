@@ -139,3 +139,75 @@ test('/bin/jsh is an alias for /bin/dsh (backwards compat)', async () => {
   expect(decode(r.stdout).trim()).toBe('via-jsh-alias');
   repl.engine.terminate();
 }, 60_000);
+
+test('dsh -c passes UTF-8 stdin through unchanged', async () => {
+  const repl = await bootRepl(() => {}, { fs: 'memory', skipPidZero: true });
+  const r = await repl.processManager.spawnSync('/bin/dsh', ['-c', 'cat; printf "|%s" "$(echo é)"'], {
+    cwd: '/',
+    stdin: new TextEncoder().encode('héllo ✓\n'),
+  });
+  expect(r.status).toBe(0);
+  expect(new TextDecoder().decode(r.stdout)).toBe('héllo ✓\n|é');
+  await repl.engine.terminate();
+}, 60_000);
+
+test('dsh -c waits for stdin that arrives after spawn', async () => {
+  const repl = await bootRepl(() => {}, { fs: 'memory', skipPidZero: true });
+  const proc = await repl.processManager.spawn('/bin/dsh', ['-c', 'wc -l'], { cwd: '/' });
+  setTimeout(() => {
+    void proc.stdin.write(new TextEncoder().encode('a\nb\n')).then(() =>
+      new Promise((resolve) => setTimeout(resolve, 50))).then(() =>
+      proc.stdin.write(new TextEncoder().encode('c\n'))).then(() => proc.stdin.close());
+  }, 100);
+  const text = await new Response(proc.stdout).text();
+  expect(await proc.exit).toBe(0);
+  expect(text.trim()).toBe('3');
+  await repl.engine.terminate();
+}, 60_000);
+
+test('dsh -c does not block on stdin when the script never reads it', async () => {
+  const repl = await bootRepl(() => {}, { fs: 'memory', skipPidZero: true });
+  const proc = await repl.processManager.spawn('/bin/dsh', ['-c', 'echo ready; (echo sub)'], { cwd: '/' });
+  const text = await new Response(proc.stdout).text();
+  expect(await proc.exit).toBe(0);
+  expect(text).toBe('ready\nsub\n');
+  await repl.engine.terminate();
+}, 60_000);
+
+test('dsh streams each statement before the script finishes', async () => {
+  const repl = await bootRepl(() => {}, { fs: 'memory', skipPidZero: true });
+  const proc = await repl.processManager.spawn('/bin/dsh', ['-c', 'for i in 1 2; do echo tick$i; sleep 1; done; echo $(echo done) | tr a-z A-Z'], { cwd: '/' });
+  const reader = proc.stdout.getReader();
+  const started = Date.now();
+  const first = await reader.read();
+  const firstAt = Date.now() - started;
+  let rest = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    rest += new TextDecoder().decode(value);
+  }
+  expect(new TextDecoder().decode(first.value)).toBe('tick1\n');
+  expect(firstAt).toBeLessThan(900);
+  expect(rest).toBe('tick2\nDONE\n');
+  expect(await proc.exit).toBe(0);
+  await repl.engine.terminate();
+}, 60_000);
+
+test('/bin/dsh runs nested shells, env and timeout without hanging', async () => {
+  const repl = await bootRepl(() => {}, { fs: 'memory', skipPidZero: true, limits: { timeoutMs: 20_000 } });
+  try {
+    const script = [
+      'bash -c "echo inner"',
+      'sh -c "exit 3"; echo "sh=$?"',
+      'env GREETING=hi sh -c \'echo $GREETING\'',
+      'timeout 0.2 sleep 5; echo "timeout=$?"',
+      'bash -c "bash -c \'echo deep\'"',
+    ].join('; ');
+    const r = await repl.processManager.spawnSync('/bin/dsh', ['-c', script], { cwd: '/' });
+    expect(decode(r.stdout)).toBe('inner\nsh=3\nhi\ntimeout=124\ndeep\n');
+    expect(r.status).toBe(0);
+  } finally {
+    await repl.dispose();
+  }
+}, 60_000);

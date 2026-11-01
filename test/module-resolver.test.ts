@@ -139,18 +139,6 @@ test('re-resolves registered native virtual IDs for SystemJS imports and CommonJ
     .rejects.toThrow();
 });
 
-test('resolves node:v8 only for ESM imports from Vite\'s node distribution', async () => {
-  const fs = createMemoryBackend();
-  await fs.mkdir('/project/node_modules/vite/dist/node', { recursive: true });
-
-  await expect(resolveModule(fs, 'node:v8', '/project/node_modules/vite/dist/node', 'import')).resolves.toEqual({
-    path: 'dusk:virtual/vite-startup-snapshot',
-    format: 'esm',
-  });
-  await expect(resolveModule(fs, 'node:v8', '/project/node_modules/vite/dist/node', 'require')).rejects.toThrow('Cannot find module node:v8');
-  await expect(resolveModule(fs, 'node:v8', '/project/app', 'import')).rejects.toThrow('Cannot find module node:v8');
-});
-
 test('resolves package imports aliases to external packages in the active mode', async () => {
   const fs = createMemoryBackend();
   await fs.mkdir('/app/node_modules/target', { recursive: true });

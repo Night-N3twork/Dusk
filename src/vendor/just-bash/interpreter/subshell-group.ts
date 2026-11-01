@@ -34,7 +34,7 @@ import {
   preOpenOutputRedirects,
   processFdVariableRedirections,
 } from "./redirections.js";
-import type { InterpreterContext } from "./types.js";
+import { restoreGroupStdin, saveGroupStdin, type InterpreterContext } from "./types.js";
 
 /**
  * Type for executeStatement callback
@@ -111,7 +111,7 @@ export async function executeSubshell(
   ctx.state.bashPid = ctx.state.nextVirtualPid++;
 
   // Save any existing groupStdin and set new one from pipeline
-  const savedGroupStdin = ctx.state.groupStdin;
+  const savedGroupStdin = saveGroupStdin(ctx.state);
   if (stdin) {
     ctx.state.groupStdin = stdin;
   }
@@ -131,7 +131,7 @@ export async function executeSubshell(
     ctx.state.fullyUnsetLocals = savedFullyUnsetLocals;
     ctx.state.loopDepth = savedLoopDepth;
     ctx.state.parentHasLoopContext = savedParentHasLoopContext;
-    ctx.state.groupStdin = savedGroupStdin;
+    restoreGroupStdin(ctx.state, savedGroupStdin);
     ctx.state.bashPid = savedBashPid;
     ctx.state.lastArg = savedLastArg;
   };
@@ -274,7 +274,7 @@ export async function executeGroup(
   }
 
   // Save any existing groupStdin and set new one from pipeline
-  const savedGroupStdin = ctx.state.groupStdin;
+  const savedGroupStdin = saveGroupStdin(ctx.state);
   if (effectiveStdin) {
     ctx.state.groupStdin = effectiveStdin;
   }
@@ -288,7 +288,7 @@ export async function executeGroup(
     }
   } catch (error) {
     // Restore groupStdin before handling error
-    ctx.state.groupStdin = savedGroupStdin;
+    restoreGroupStdin(ctx.state, savedGroupStdin);
     // ExecutionLimitError must always propagate - these are safety limits
     if (error instanceof ExecutionLimitError) {
       throw error;
@@ -305,7 +305,7 @@ export async function executeGroup(
   }
 
   // Restore groupStdin
-  ctx.state.groupStdin = savedGroupStdin;
+  restoreGroupStdin(ctx.state, savedGroupStdin);
 
   // Apply output redirections
   const bodyResult = result(stdout, stderr, exitCode);
@@ -407,7 +407,7 @@ export async function executeUserScript(
   const savedParentHasLoopContext = ctx.state.parentHasLoopContext;
   const savedLastArg = ctx.state.lastArg;
   const savedBashPid = ctx.state.bashPid;
-  const savedGroupStdin = ctx.state.groupStdin;
+  const savedGroupStdin = saveGroupStdin(ctx.state);
   const savedSource = ctx.state.currentSource;
 
   // Set up subshell-like environment
@@ -441,7 +441,7 @@ export async function executeUserScript(
     ctx.state.parentHasLoopContext = savedParentHasLoopContext;
     ctx.state.lastArg = savedLastArg;
     ctx.state.bashPid = savedBashPid;
-    ctx.state.groupStdin = savedGroupStdin;
+    restoreGroupStdin(ctx.state, savedGroupStdin);
     ctx.state.currentSource = savedSource;
   };
 

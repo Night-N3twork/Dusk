@@ -113,7 +113,7 @@ export const createStreamSink = (producerPid?: number): { id: number; readable: 
  * `creditGranted` dispatch fires for this stream id.
  */
 export const pushStreamChunk = (id: number, data: Uint8Array): number => {
-  const v = __call('stream.pushChunk', { id, data: Array.from(data) }) as { credit: number };
+  const v = __call('stream.pushChunk', { id, data }) as { credit: number };
   return v.credit;
 };
 

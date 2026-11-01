@@ -201,10 +201,8 @@ export function createDefenseAwareCommandContext(
   }
 
   const component = `command:${commandName}`;
-  const wrappedCtx: CommandContext = {
-    ...ctx,
-    fs: wrapFileSystem(ctx.fs, ctx.requireDefenseContext, component),
-  };
+  const wrappedCtx = Object.defineProperties({}, Object.getOwnPropertyDescriptors(ctx)) as CommandContext;
+  wrappedCtx.fs = wrapFileSystem(ctx.fs, ctx.requireDefenseContext, component);
 
   if (ctx.exec) {
     wrappedCtx.exec = wrapFunction(

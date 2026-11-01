@@ -31,6 +31,7 @@ export interface SocketRegistry {
   registerServer(host: string, port: number, enginePid: number, onConn: (clientSocketId: number) => void): RegisteredServer;
   unregisterServer(id: number): void;
   findServer(host: string, port: number): RegisteredServer | undefined;
+  hasHost(host: string): boolean;
   allocateSocketId(): number;
   // Per-socket pair channels
   setPair(socketId: number, pair: SocketPair): void;
@@ -85,9 +86,22 @@ export const createSocketRegistry = (): SocketRegistry => {
       if (direct) return direct;
       // Allow 127.0.0.1 ↔ localhost ↔ 0.0.0.0 aliasing
       if (host === '127.0.0.1' || host === 'localhost') {
-        return servers.get(keyOf('0.0.0.0', port)) ?? servers.get(keyOf('localhost', port)) ?? servers.get(keyOf('127.0.0.1', port));
+        const loopback = servers.get(keyOf('0.0.0.0', port)) ?? servers.get(keyOf('localhost', port)) ?? servers.get(keyOf('127.0.0.1', port));
+        if (loopback) return loopback;
+        let match: RegisteredServer | undefined;
+        for (const server of servers.values()) {
+          if (server.port !== port) continue;
+          if (match) return undefined;
+          match = server;
+        }
+        return match;
       }
       return undefined;
+    },
+    hasHost(host) {
+      const lower = host.toLowerCase();
+      for (const server of servers.values()) if (server.host.toLowerCase() === lower) return true;
+      return false;
     },
     allocateSocketId() {
       return nextSocketId++;

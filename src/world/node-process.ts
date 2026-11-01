@@ -311,6 +311,11 @@ class ProcessSingleton extends EventEmitter {
     } catch { /* */ }
   }
 
+  getBuiltinModule(id: string): unknown {
+    const lookup = (globalThis as Record<string, unknown>)['__duskGetBuiltinModule'] as ((id: string) => unknown) | undefined;
+    return lookup ? lookup(id) : undefined;
+  }
+
   binding(name: string): never {
     const err = new Error('process.binding is not supported');
     (err as unknown as Record<string, unknown>)['code'] = 'ERR_UNSUPPORTED';
@@ -372,14 +377,13 @@ const createHrtime = (): ProcessHrtime => {
 };
 
 // Simple proc.write-backed fallback for non-REPL pids. Spawned children keep
-// this shape so `pipeChildToParent` (Plan 2) — which already pumps stdout/stderr
-// via its own path — is untouched. Registering a second sink via the stream
-// registry here would double-pump the child's output (see reverted commit
-// 9dda344 for what went wrong).
+// this shape so `pipeChildToParent`, which already pumps stdout/stderr via its
+// own path, is untouched. Registering a second sink via the stream registry
+// here would double-pump the child's output.
 const makeProcWriteFallback = (fd: number): { write: (data: string | Uint8Array) => boolean; end: () => void; isTTY?: boolean } => {
   return {
     write(data: string | Uint8Array): boolean {
-      const bytes = typeof data === 'string' ? encodeUtf8(data) : Array.from(data);
+      const bytes = typeof data === 'string' ? encodeUtf8(data) : data;
       try { __call('proc.write', { fd, data: bytes }); } catch { /* */ }
       return true;
     },
@@ -480,6 +484,7 @@ export const installNodeProcess = (): ProcessSingleton => {
 
   // Signal dispatch hook: world.ts dispatch loop will call this when receiving signal envelopes
   const procRec = (g['__process'] as Record<string, unknown> | undefined) ?? {};
+  const exitProcess = proc.exit.bind(proc);
   procRec['onSignal'] = (signame: string, _signo?: number, payload?: unknown): void => {
     const had = proc.listenerCount(signame) > 0;
     try { proc.emit(signame, signame, payload); } catch { /* */ }
@@ -489,7 +494,7 @@ export const installNodeProcess = (): ProcessSingleton => {
         const num = (typeof signame === 'string' && signame.startsWith('SIG'))
           ? (signalNumberFromName(signame as SignalName) ?? 15)
           : 15;
-        proc.exit(128 + num);
+        exitProcess(128 + num);
       }
     }
   };

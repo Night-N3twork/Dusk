@@ -118,7 +118,7 @@ export const timeCommand: Command = {
       result = await ctx.exec(shellJoinArgs([commandArgs[0]]), {
         env: mapToRecord(ctx.env),
         cwd: ctx.cwd,
-        stdin: latin1FromBytes(ctx.stdin),
+        stdinLoader: () => latin1FromBytes(ctx.stdin),
         // ctx.stdin is already byte-shaped — forward verbatim.
         stdinKind: "bytes",
         signal: ctx.signal,

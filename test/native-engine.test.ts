@@ -14,8 +14,8 @@ test('native loader acknowledges a sync RPC only after decoding its reply', asyn
   const response = await fetch(new URL('../src/worker/native-loader.ts?worker_file&type=module', import.meta.url));
   const source = await response.text();
 
-  expect(source.indexOf('response = decoder.decode')).toBeGreaterThan(-1);
-  expect(source.indexOf('sync-rpc-consumed')).toBeGreaterThan(source.indexOf('response = decoder.decode'));
+  expect(source.indexOf('return read(size)')).toBeGreaterThan(-1);
+  expect(source.indexOf('sync-rpc-consumed')).toBeGreaterThan(source.indexOf('return read(size)'));
 });
 
 class MockWorker {

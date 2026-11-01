@@ -74,8 +74,9 @@ export const main = async (): Promise<number> => {
     }
     await waitForActiveHandles();
     await (globalThis as { __process?: { __duskLifecycle?: { whenIdle(): Promise<void> } } }).__process?.__duskLifecycle?.whenIdle();
-    proc?.exit?.(0);
-    return 0;
+    const code = (proc as { exitCode?: number } | undefined)?.exitCode ?? 0;
+    proc?.exit?.(code);
+    return code;
   } catch (e) {
     // SpiderMonkey's Error.stack omits the `name: message` header line,
     // so relying on stack alone loses the actual error text and makes
@@ -93,7 +94,7 @@ export const main = async (): Promise<number> => {
   }
 };
 
-const waitForActiveHandles = async (): Promise<void> => {
+export const waitForActiveHandles = async (): Promise<void> => {
   while (true) {
     // Let script-scheduled microtasks establish handles before deciding the
     // process is idle. Repeat after each release for close callbacks that

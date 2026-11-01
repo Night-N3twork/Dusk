@@ -7,6 +7,7 @@ import {
   type WorldToHost,
 } from '../protocol/messages';
 import { resolveSpiderMonkey } from '../engine/spidermonkey';
+import { bytesAsArrays, encodeFrame } from '../protocol/frame';
 import rollupBrowserWasmUrl from './rollup-browser/bindings_wasm_bg.wasm?url';
 import esbuildBrowserUrl from './esbuild-wasm/lib/browser.min.js?url&no-inline';
 import esbuildWasmUrl from './esbuild-wasm/esbuild.wasm?url&no-inline';
@@ -21,6 +22,7 @@ export interface EngineInstance {
   dispatch(js: string): Promise<void>;
   terminate(): Promise<number>;
   readonly exited: Promise<number>;
+  stageBytes?(bytes: Uint8Array): string;
 }
 
 export type DuskRuntime = 'native' | 'spidermonkey-legacy';
@@ -116,12 +118,18 @@ const createWorkerEngine = async (pid: number, funcs: FuncTable, worker: Worker,
   // (~344 KB in the current build) on the host heap.
 
   const send: SendFn = (msg) => {
-    const bytes = encoder.encode(JSON.stringify(msg));
-    if (bytes.length > SERIAL_RES_SIZE) {
-      throw new Error('IPC response exceeds SERIAL_RES_SIZE limit (' + bytes.length + ' > ' + SERIAL_RES_SIZE + ')');
+    let size: number;
+    if (nativeTransport) {
+      size = encodeFrame(msg, encoder, valueTyped);
+    } else {
+      const bytes = encoder.encode(JSON.stringify(msg, bytesAsArrays));
+      if (bytes.length > SERIAL_RES_SIZE) {
+        throw new Error('IPC response exceeds SERIAL_RES_SIZE limit (' + bytes.length + ' > ' + SERIAL_RES_SIZE + ')');
+      }
+      valueTyped.set(bytes, 0);
+      size = bytes.length;
     }
-    for (let i = 0; i < bytes.length; i++) Atomics.store(valueTyped, i, bytes[i]!);
-    Atomics.store(lengthTyped, 0, bytes.length);
+    Atomics.store(lengthTyped, 0, size);
     Atomics.notify(lengthTyped, 0);
   };
 
@@ -253,8 +261,17 @@ const createWorkerEngine = async (pid: number, funcs: FuncTable, worker: Worker,
     else sendReply({});
   };
 
+  let nextStagedBytes = 1;
+  const stageBytes = (bytes: Uint8Array): string => {
+    if (!nativeTransport) return JSON.stringify(Array.from(bytes));
+    const id = nextStagedBytes++;
+    worker.postMessage({ type: 'bytes', id, data: bytes });
+    return `globalThis.__duskTakeBytes(${id})`;
+  };
+
   return {
     pid,
+    stageBytes,
       run: (js: string) => new Promise<void>((resolve) => {
         if (settled) {
           resolve();

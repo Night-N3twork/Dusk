@@ -1,7 +1,7 @@
 import { nodeFs } from './node-fs';
 import { nodePath } from './node-path';
 import { nodeChildProcess } from './node-child-process';
-import { nodeEvents, EventEmitter, once as eventsOnce, on as eventsOn, setMaxListeners, getEventListeners } from './node-events';
+import { EventEmitter, once as eventsOnce, on as eventsOn, setMaxListeners, getEventListeners } from './node-events';
 import { nodeBuffer, Buffer } from './node-buffer';
 import { nodeProcess } from './node-process';
 import { codes, isNodeError } from './node-errors';
@@ -34,6 +34,12 @@ import { nodeCluster } from './node-cluster';
 import { nodeWorkerThreads } from './node-worker-threads';
 import { nodeSourceMapSupport } from './node-sourcemap-support';
 import { nodeModule } from './node-module';
+import { nodeDiagnosticsChannel } from './node-diagnostics-channel';
+import { nodeV8 } from './node-v8';
+import { nodeHttp2 } from './node-http2';
+import { nodeDgram } from './node-dgram';
+import { nodeSqlite } from './node-sqlite';
+import { nodeTest } from './node-test';
 
 declare const ipc: { send: (m: unknown, i?: boolean) => { value?: unknown; error?: string } };
 
@@ -123,6 +129,12 @@ export const installRequire = (): void => {
     'node:cluster': nodeCluster, 'cluster': nodeCluster,
     'node:worker_threads': nodeWorkerThreads, 'worker_threads': nodeWorkerThreads,
     'node:module': nodeModule, 'module': nodeModule,
+    'node:diagnostics_channel': nodeDiagnosticsChannel, 'diagnostics_channel': nodeDiagnosticsChannel,
+    'node:v8': nodeV8, 'v8': nodeV8,
+    'node:http2': nodeHttp2, 'http2': nodeHttp2,
+    'node:dgram': nodeDgram, 'dgram': nodeDgram,
+    'node:sqlite': nodeSqlite,
+    'node:test': nodeTest,
     'node:util/types': types, 'util/types': types,
     'node:constants': nodeConstantsModule, 'constants': nodeConstantsModule,
     'source-map-support': nodeSourceMapSupport, '@cspotcode/source-map-support': nodeSourceMapSupport,
@@ -143,16 +155,26 @@ export const installRequire = (): void => {
   if (g['Buffer'] === undefined) g['Buffer'] = Buffer;
   if (g['EventEmitter'] === undefined) g['EventEmitter'] = EventEmitter;
 
+  const importMetaFor = (path: string, localRequire: { resolve(request: string): string }): Record<string, unknown> => ({
+    url: 'file://' + encodeURI(path),
+    filename: path,
+    dirname: dirOf(path),
+    resolve: (request: string): string => {
+      if (request in builtins) return request.startsWith('node:') ? request : 'node:' + request;
+      return 'file://' + encodeURI(localRequire.resolve(request));
+    },
+  });
+
   const makeRequire = (fromDir: string) => {
     const require = (request: string): unknown => {
       if (request in builtins) return builtins[request];
       const resolvedModule = call('module.resolve', { request, fromDir, mode: 'require' }) as { path: string; format: 'esm' | 'cjs' | 'json' };
       const resolved = resolvedModule.path;
-      if (resolvedModule.format === 'esm') throw new Error(`ERR_REQUIRE_ESM: require() of ES Module ${resolved} is not supported`);
       const cached = cache.get(resolved);
       if (cached) return cached.exports;
 
-      let source = call('module.readSource', { path: resolved }) as string;
+      const esm = resolvedModule.format === 'esm';
+      let source = call('module.readSource', { path: resolved, ...(esm ? { mode: 'require-esm' } : {}) }) as string;
       const module = { exports: {} as unknown };
       cache.set(resolved, module);
 
@@ -163,20 +185,35 @@ export const installRequire = (): void => {
           source = newline === -1 ? '' : source.slice(newline + 1);
         }
         const dir = dirOf(resolved);
+        const localRequire = makeRequire(dir);
         const fn = (0, eval)(
-          '(function(exports, require, module, __filename, __dirname){' + source + '\n})'
-        ) as (e: unknown, r: unknown, m: unknown, fn: string, dn: string) => void;
-        fn(module.exports, makeRequire(dir), module, resolved, dir);
+          '(function(exports, require, module, __filename, __dirname, __duskImportMeta){' + source + '\n})'
+        ) as (e: unknown, r: unknown, m: unknown, fn: string, dn: string, meta: unknown) => void;
+        fn(module.exports, localRequire, module, resolved, dir, esm ? importMetaFor(resolved, localRequire) : undefined);
+        if (esm) {
+          const namespace = module.exports as Record<string, unknown>;
+          if (namespace && Object.prototype.hasOwnProperty.call(namespace, 'module.exports')) module.exports = namespace['module.exports'];
+        }
         return module.exports;
       } catch (error) {
         cache.delete(resolved);
         throw error;
       }
     };
-    require.resolve = (request: string): string =>
-      (call('module.resolve', { request, fromDir, mode: 'require' }) as { path: string }).path;
+    require.resolve = (request: string): string => {
+      if (request in builtins) return request;
+      return (call('module.resolve', { request, fromDir, mode: 'require' }) as { path: string }).path;
+    };
+    require.cache = cache;
     return require;
   };
+
+  const getBuiltinModule = (id: string): unknown => {
+    if (typeof id !== 'string') throw new TypeError('The "id" argument must be of type string');
+    if (id in builtins && !id.startsWith('__dusk_')) return builtins[id];
+    return undefined;
+  };
+  (globalThis as Record<string, unknown>)['__duskGetBuiltinModule'] = getBuiltinModule;
 
   (globalThis as Record<string, unknown>)['require'] = makeRequire('/');
   (globalThis as Record<string, unknown>)['__duskRequireFrom'] = (fromDir: string) => makeRequire(fromDir);

@@ -9,7 +9,7 @@
 import type { ScriptNode } from "../../ast/types.js";
 import { Parser } from "../../parser/parser.js";
 import { ExecutionLimitError, ExitError } from "../errors.js";
-import type { InterpreterContext } from "../types.js";
+import { captureOutput, type InterpreterContext } from "../types.js";
 import { escapeGlobChars } from "./glob-escape.js";
 
 /**
@@ -124,7 +124,7 @@ async function executeCommandSubstitutionFromString(
   ctx.state.suppressVerbose = true;
 
   try {
-    const result = await ctx.executeScript(ast);
+    const result = await captureOutput(ctx, () => ctx.executeScript(ast));
     // Restore environment but preserve exit code
     const exitCode = result.exitCode;
     ctx.state.env = savedEnv;

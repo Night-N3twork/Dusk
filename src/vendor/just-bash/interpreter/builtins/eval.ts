@@ -15,7 +15,7 @@ import {
   ReturnError,
 } from "../errors.js";
 import { failure, OK } from "../helpers/result.js";
-import type { InterpreterContext } from "../types.js";
+import { restoreGroupStdin, saveGroupStdin, type InterpreterContext } from "../types.js";
 
 export async function handleEval(
   ctx: InterpreterContext,
@@ -53,10 +53,9 @@ export async function handleEval(
 
   // Save and set groupStdin for piped eval commands
   // This allows stdin from the pipeline to flow to commands within eval
-  const savedGroupStdin = ctx.state.groupStdin;
-  const effectiveStdin = stdin ?? ctx.state.groupStdin;
-  if (effectiveStdin !== undefined) {
-    ctx.state.groupStdin = effectiveStdin;
+  const savedGroupStdin = saveGroupStdin(ctx.state);
+  if (stdin !== undefined) {
+    ctx.state.groupStdin = stdin;
   }
 
   try {
@@ -79,6 +78,6 @@ export async function handleEval(
     throw error;
   } finally {
     // Restore groupStdin
-    ctx.state.groupStdin = savedGroupStdin;
+    restoreGroupStdin(ctx.state, savedGroupStdin);
   }
 }

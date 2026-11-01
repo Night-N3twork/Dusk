@@ -1,5 +1,12 @@
 declare const ipc: { send: (m: unknown, i?: boolean) => { value?: unknown; error?: string } };
 import { codes, errnoError } from './node-errors';
+import {
+  OID, bigintFromBytes, bitString, bytesFromBigint, derToP1363, ecPrivateScalar, encodeOid, integer, keyMaterial,
+  octetString, p1363ToDer, pkcs1PrivateToPkcs8, pkcs1PublicToSpki, sequence,
+} from './crypto-der';
+import { curveName, decodePoint, ecdsaSign, ecdsaVerify, encodePoint, getCurve, modPow, publicPoint, randomScalar, sharedSecret, type Curve } from './crypto-ec';
+import { KeyObject, createPrivateKey, createPublicKey, createSecretKey, ecKeyPair, keyOptions, keyPairFromDer } from './crypto-keys';
+import { MODP_GROUPS } from './crypto-groups';
 
 const __call = (f: string, extra: Record<string, unknown> = {}): unknown => {
   const r = ipc.send({ f, ...extra });
@@ -14,9 +21,6 @@ const __call = (f: string, extra: Record<string, unknown> = {}): unknown => {
   }
   return r.value;
 };
-
-const u8FromArrayLike = (v: number[] | Uint8Array): Uint8Array =>
-  v instanceof Uint8Array ? v : Uint8Array.from(v);
 
 const toBytes = (data: unknown, encoding: string = 'utf8'): Uint8Array => {
   if (data instanceof Uint8Array) return data;
@@ -263,10 +267,6 @@ const sha1Bytes = (data: Uint8Array): Uint8Array => {
 
 // ---- SubtleCrypto-routed sha256/sha384/sha512 ----
 
-const isSubtleCryptoAvailable = (): boolean => {
-  return typeof crypto !== 'undefined' && typeof crypto.subtle !== 'undefined' && typeof crypto.subtle.digest === 'function';
-};
-
 const SUBTLE_ALG: Record<string, string> = {
   'sha-1': 'SHA-1', sha1: 'SHA-1',
   'sha-256': 'SHA-256', sha256: 'SHA-256',
@@ -281,7 +281,7 @@ const hashSync = (alg: string, data: Uint8Array): Uint8Array => {
 
   if (SUBTLE_ALG[lower]) {
     // Subtle is async; we go through the host IPC which can use it synchronously via Atomics.
-    const result = __call('crypto.digest', { algorithm: SUBTLE_ALG[lower]!.toLowerCase(), data: Array.from(data) }) as number[] | undefined;
+    const result = __call('crypto.digest', { algorithm: SUBTLE_ALG[lower]!.toLowerCase(), data: data }) as number[] | undefined;
     if (result) return Uint8Array.from(result);
   }
 
@@ -364,7 +364,7 @@ export class Hmac {
       result = hmacPureJS(this._alg, this._key, concat);
     } else {
       const alg = (SUBTLE_ALG[this._alg] ?? `SHA-256`).toLowerCase();
-      const arr = __call('crypto.hmac', { algorithm: alg, key: Array.from(this._key), data: Array.from(concat) }) as number[] | undefined;
+      const arr = __call('crypto.hmac', { algorithm: alg, key: this._key, data: concat }) as number[] | undefined;
       result = arr ? Uint8Array.from(arr) : hmacPureJS('sha256', this._key, concat);
     }
     if (!encoding) return bytesToBuffer(result);
@@ -426,8 +426,8 @@ export const pbkdf2Sync = (password: unknown, salt: unknown, iterations: number,
   const s = toBytes(salt);
   const subtleAlg = SUBTLE_ALG[digest.toLowerCase()] ?? 'SHA-256';
   const arr = __call('crypto.pbkdf2', {
-    password: Array.from(p),
-    salt: Array.from(s),
+    password: p,
+    salt: s,
     iterations,
     keylen,
     digest: subtleAlg,
@@ -506,10 +506,10 @@ export class Cipher {
 
     const result = __call('crypto.encrypt', {
       algorithm: this._alg,
-      key: Array.from(this._key),
-      iv: Array.from(this._iv),
-      plaintext: Array.from(plaintext),
-      ...(this._aad ? { aad: Array.from(this._aad) } : {}),
+      key: this._key,
+      iv: this._iv,
+      plaintext: plaintext,
+      ...(this._aad ? { aad: this._aad } : {}),
     }) as { ciphertext: number[]; authTag?: number[] } | undefined;
 
     if (!result) throw codes.ERR_OPERATION_FAILED!('cipher.final');
@@ -570,11 +570,11 @@ export class Decipher {
 
     const result = __call('crypto.decrypt', {
       algorithm: this._alg,
-      key: Array.from(this._key),
-      iv: Array.from(this._iv),
-      ciphertext: Array.from(ciphertext),
-      ...(this._authTag ? { authTag: Array.from(this._authTag) } : {}),
-      ...(this._aad ? { aad: Array.from(this._aad) } : {}),
+      key: this._key,
+      iv: this._iv,
+      ciphertext: ciphertext,
+      ...(this._authTag ? { authTag: this._authTag } : {}),
+      ...(this._aad ? { aad: this._aad } : {}),
     }) as { plaintext: number[] } | undefined;
 
     if (!result) throw codes.ERR_OPERATION_FAILED!('decipher.final');
@@ -590,16 +590,97 @@ export const createDecipheriv = (alg: string, key: unknown, iv: unknown, _opts?:
   return new Decipher(alg, key, iv);
 };
 
-// ---- scrypt (pure-JS slow; only acceptable for very small N) ----
-// We provide a basic implementation; for production use users should pick another lib.
+interface ScryptOptions {
+  N?: number; r?: number; p?: number; maxmem?: number;
+  cost?: number; blockSize?: number; parallelization?: number;
+}
 
-export const scryptSync = (
-  password: unknown, salt: unknown, keylen: number,
-  _opts?: { N?: number; r?: number; p?: number; maxmem?: number },
-): Uint8Array => {
-  // Fall back to PBKDF2 with high iterations as a stand-in.
-  // This is NOT real scrypt; documented as such.
-  return pbkdf2Sync(password, salt, 100000, keylen, 'sha256');
+const salsa20x8 = (b: Uint32Array): void => {
+  let x0 = b[0]!, x1 = b[1]!, x2 = b[2]!, x3 = b[3]!, x4 = b[4]!, x5 = b[5]!, x6 = b[6]!, x7 = b[7]!;
+  let x8 = b[8]!, x9 = b[9]!, x10 = b[10]!, x11 = b[11]!, x12 = b[12]!, x13 = b[13]!, x14 = b[14]!, x15 = b[15]!;
+  const R = (a: number, n: number): number => (a << n) | (a >>> (32 - n));
+  for (let i = 0; i < 8; i += 2) {
+    x4 ^= R(x0 + x12, 7); x8 ^= R(x4 + x0, 9); x12 ^= R(x8 + x4, 13); x0 ^= R(x12 + x8, 18);
+    x9 ^= R(x5 + x1, 7); x13 ^= R(x9 + x5, 9); x1 ^= R(x13 + x9, 13); x5 ^= R(x1 + x13, 18);
+    x14 ^= R(x10 + x6, 7); x2 ^= R(x14 + x10, 9); x6 ^= R(x2 + x14, 13); x10 ^= R(x6 + x2, 18);
+    x3 ^= R(x15 + x11, 7); x7 ^= R(x3 + x15, 9); x11 ^= R(x7 + x3, 13); x15 ^= R(x11 + x7, 18);
+    x1 ^= R(x0 + x3, 7); x2 ^= R(x1 + x0, 9); x3 ^= R(x2 + x1, 13); x0 ^= R(x3 + x2, 18);
+    x6 ^= R(x5 + x4, 7); x7 ^= R(x6 + x5, 9); x4 ^= R(x7 + x6, 13); x5 ^= R(x4 + x7, 18);
+    x11 ^= R(x10 + x9, 7); x8 ^= R(x11 + x10, 9); x9 ^= R(x8 + x11, 13); x10 ^= R(x9 + x8, 18);
+    x12 ^= R(x15 + x14, 7); x13 ^= R(x12 + x15, 9); x14 ^= R(x13 + x12, 13); x15 ^= R(x14 + x13, 18);
+  }
+  b[0] = b[0]! + x0; b[1] = b[1]! + x1; b[2] = b[2]! + x2; b[3] = b[3]! + x3;
+  b[4] = b[4]! + x4; b[5] = b[5]! + x5; b[6] = b[6]! + x6; b[7] = b[7]! + x7;
+  b[8] = b[8]! + x8; b[9] = b[9]! + x9; b[10] = b[10]! + x10; b[11] = b[11]! + x11;
+  b[12] = b[12]! + x12; b[13] = b[13]! + x13; b[14] = b[14]! + x14; b[15] = b[15]! + x15;
+};
+
+const blockMix = (b: Uint32Array, y: Uint32Array, x: Uint32Array, r: number): void => {
+  x.set(b.subarray((2 * r - 1) * 16, 2 * r * 16));
+  for (let i = 0; i < 2 * r; i++) {
+    for (let j = 0; j < 16; j++) x[j] = x[j]! ^ b[i * 16 + j]!;
+    salsa20x8(x);
+    y.set(x, i * 16);
+  }
+  for (let i = 0; i < r; i++) {
+    b.set(y.subarray(2 * i * 16, (2 * i + 1) * 16), i * 16);
+    b.set(y.subarray((2 * i + 1) * 16, (2 * i + 2) * 16), (r + i) * 16);
+  }
+};
+
+const roMix = (block: Uint8Array, n: number, r: number): void => {
+  const words = 32 * r;
+  const b = new Uint32Array(words);
+  for (let i = 0; i < words; i++) {
+    const o = i * 4;
+    b[i] = block[o]! | (block[o + 1]! << 8) | (block[o + 2]! << 16) | (block[o + 3]! << 24);
+  }
+  const v = new Uint32Array(words * n);
+  const y = new Uint32Array(words);
+  const x = new Uint32Array(16);
+  for (let i = 0; i < n; i++) {
+    v.set(b, i * words);
+    blockMix(b, y, x, r);
+  }
+  for (let i = 0; i < n; i++) {
+    const j = b[(2 * r - 1) * 16]! & (n - 1);
+    const off = j * words;
+    for (let k = 0; k < words; k++) b[k] = b[k]! ^ v[off + k]!;
+    blockMix(b, y, x, r);
+  }
+  for (let i = 0; i < words; i++) {
+    const o = i * 4;
+    const w = b[i]!;
+    block[o] = w & 0xff;
+    block[o + 1] = (w >>> 8) & 0xff;
+    block[o + 2] = (w >>> 16) & 0xff;
+    block[o + 3] = (w >>> 24) & 0xff;
+  }
+};
+
+const scryptParams = (opts: ScryptOptions | undefined): { n: number; r: number; p: number; maxmem: number } => {
+  const pick = (a: number | undefined, b: number | undefined, names: [string, string], fallback: number): number => {
+    if (a !== undefined && b !== undefined) throw codes.ERR_INCOMPATIBLE_OPTION_PAIR!(names[0], names[1]);
+    return a ?? b ?? fallback;
+  };
+  const n = pick(opts?.N, opts?.cost, ['N', 'cost'], 16384);
+  const r = pick(opts?.r, opts?.blockSize, ['r', 'blockSize'], 8);
+  const p = pick(opts?.p, opts?.parallelization, ['p', 'parallelization'], 1);
+  const maxmem = opts?.maxmem ?? 32 * 1024 * 1024;
+  if (!Number.isInteger(n) || n < 2 || (n & (n - 1)) !== 0) throw codes.ERR_CRYPTO_INVALID_SCRYPT_PARAMS!('N must be a power of 2 greater than 1');
+  if (!Number.isInteger(r) || r < 1) throw codes.ERR_CRYPTO_INVALID_SCRYPT_PARAMS!('r must be a positive integer');
+  if (!Number.isInteger(p) || p < 1 || p * r > 0x3fffffff) throw codes.ERR_CRYPTO_INVALID_SCRYPT_PARAMS!('p must be a positive integer');
+  if (128 * n * r > maxmem) throw codes.ERR_CRYPTO_INVALID_SCRYPT_PARAMS!('memory limit exceeded');
+  return { n, r, p, maxmem };
+};
+
+export const scryptSync = (password: unknown, salt: unknown, keylen: number, opts?: ScryptOptions): Uint8Array => {
+  if (!Number.isInteger(keylen) || keylen < 0) throw codes.ERR_OUT_OF_RANGE!('keylen', '>= 0 && integer', keylen);
+  const { n, r, p } = scryptParams(opts);
+  const pw = toBytes(password);
+  const blocks = toBytes(pbkdf2Sync(pw, salt, 1, p * 128 * r, 'sha256'));
+  for (let i = 0; i < p; i++) roMix(blocks.subarray(i * 128 * r, (i + 1) * 128 * r), n, r);
+  return pbkdf2Sync(pw, blocks, 1, keylen, 'sha256');
 };
 
 export const scrypt = (
@@ -607,104 +688,128 @@ export const scrypt = (
   optsOrCb: unknown, maybeCb?: Function,
 ): void => {
   const cb = (typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as (e: Error | null, key?: Uint8Array) => void;
-  if (!cb) throw codes.ERR_INVALID_CALLBACK!(cb);
+  if (typeof cb !== 'function') throw codes.ERR_INVALID_CALLBACK!(cb);
+  const opts = typeof optsOrCb === 'object' && optsOrCb !== null ? optsOrCb as ScryptOptions : undefined;
+  scryptParams(opts);
   Promise.resolve().then(() => {
-    try { cb(null, scryptSync(password, salt, keylen)); }
-    catch (e) { cb(e as Error); }
+    let key: Uint8Array;
+    try { key = scryptSync(password, salt, keylen, opts); }
+    catch (e) { cb(e as Error); return; }
+    cb(null, key);
   });
 };
 
-// ---- Asymmetric crypto (sign/verify/generateKeyPair) ----
-//
-// Backed by SubtleCrypto via host IPC. Supports RSA-PKCS1, RSA-PSS, and ECDSA.
-// Keys may be supplied as Node-style KeyObjects (any object with a `key` field),
-// raw DER bytes (Uint8Array), or PEM strings.
-
-interface KeyMaterial {
-  bytes: Uint8Array;
-  keyType: 'rsa' | 'rsa-pss' | 'ec';
-  format: 'spki' | 'pkcs8';
-}
-
-const base64DecodeToBytes = (s: string): Uint8Array => {
-  const g = globalThis as Record<string, unknown>;
-  const Buffer = g['Buffer'] as undefined | { from(s: string, e?: string): Uint8Array };
-  if (Buffer) return Buffer.from(s, 'base64');
-  const bin = atob(s);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-};
-
-const stripPem = (pem: string): { type: string; body: Uint8Array } | null => {
-  const m = /-----BEGIN (.+?)-----([\s\S]+?)-----END \1-----/.exec(pem);
-  if (!m) return null;
-  const body = base64DecodeToBytes(m[2]!.replace(/\s+/g, ''));
-  return { type: m[1]!, body };
-};
-
-const inferKeyTypeFromAlgorithm = (algorithm: string): 'rsa' | 'rsa-pss' | 'ec' => {
-  const a = algorithm.toLowerCase();
-  if (a.includes('rsa-pss') || a.includes('rsapss')) return 'rsa-pss';
-  if (a.includes('ecdsa') || a.startsWith('ec-')) return 'ec';
-  return 'rsa';
-};
-
 const inferHashFromAlgorithm = (algorithm: string): string => {
-  const a = algorithm.toLowerCase();
+  const a = algorithm.toLowerCase().replace(/^rsa-/, '');
   if (a.includes('sha512') || a.includes('sha-512')) return 'SHA-512';
   if (a.includes('sha384') || a.includes('sha-384')) return 'SHA-384';
-  if (a.includes('sha224') || a.includes('sha-224')) return 'SHA-224';
   if (a.includes('sha1') || a.includes('sha-1')) return 'SHA-1';
-  if (a.includes('md5')) return 'SHA-256'; // SubtleCrypto can't md5; substitute
-  return 'SHA-256';
+  if (a.includes('sha256') || a.includes('sha-256')) return 'SHA-256';
+  throw codes.ERR_CRYPTO_INVALID_DIGEST!(algorithm);
 };
 
-const extractKeyMaterial = (key: unknown, expectPrivate: boolean): KeyMaterial => {
-  // KeyObject-like: { key, type, format }
-  if (key && typeof key === 'object') {
-    const k = key as { key?: unknown; type?: string; format?: string };
-    if (k.key !== undefined) {
-      const inner = extractKeyMaterial(k.key, expectPrivate);
-      return inner;
-    }
-  }
-  let raw: Uint8Array;
-  let pemType: string | null = null;
-  if (typeof key === 'string') {
-    const p = stripPem(key);
-    if (p) {
-      raw = p.body;
-      pemType = p.type;
-    } else {
-      // Treat as base64
-      raw = base64DecodeToBytes(key);
-    }
-  } else if (key instanceof Uint8Array) {
-    raw = key;
-  } else if (Array.isArray(key)) {
-    raw = Uint8Array.from(key as number[]);
-  } else if (ArrayBuffer.isView(key)) {
-    raw = new Uint8Array((key as ArrayBufferView).buffer, (key as ArrayBufferView).byteOffset, (key as ArrayBufferView).byteLength);
-  } else {
-    throw codes.ERR_INVALID_ARG_TYPE!('key', ['string', 'Buffer', 'KeyObject'], key);
-  }
+const HASH_LENGTHS: Record<string, number> = { 'SHA-1': 20, 'SHA-256': 32, 'SHA-384': 48, 'SHA-512': 64 };
 
-  // Infer DER format from PEM headers when available
-  let format: 'spki' | 'pkcs8';
-  let keyType: 'rsa' | 'rsa-pss' | 'ec' = 'rsa';
-  if (pemType) {
-    const t = pemType.toUpperCase();
-    if (t.includes('PRIVATE')) format = 'pkcs8';
-    else format = 'spki';
-    if (t.includes('EC') || t.includes('ECDSA')) keyType = 'ec';
-    else if (t.includes('RSA-PSS') || t.includes('PSS')) keyType = 'rsa-pss';
-    else keyType = 'rsa';
-  } else {
-    format = expectPrivate ? 'pkcs8' : 'spki';
-    // Caller will override keyType based on algorithm
+export const constants = Object.freeze({
+  RSA_PKCS1_PADDING: 1,
+  RSA_NO_PADDING: 3,
+  RSA_PKCS1_OAEP_PADDING: 4,
+  RSA_X931_PADDING: 5,
+  RSA_PKCS1_PSS_PADDING: 6,
+  RSA_PSS_SALTLEN_DIGEST: -1,
+  RSA_PSS_SALTLEN_MAX_SIGN: -2,
+  RSA_PSS_SALTLEN_AUTO: -2,
+  POINT_CONVERSION_COMPRESSED: 2,
+  POINT_CONVERSION_UNCOMPRESSED: 4,
+  POINT_CONVERSION_HYBRID: 6,
+  DH_CHECK_P_NOT_PRIME: 1,
+  DH_CHECK_P_NOT_SAFE_PRIME: 2,
+  DH_UNABLE_TO_CHECK_GENERATOR: 4,
+  DH_NOT_SUITABLE_GENERATOR: 8,
+});
+
+interface SignatureOptions { dsaEncoding?: 'der' | 'ieee-p1363'; padding?: number; saltLength?: number }
+
+const outputBytes = (bytes: Uint8Array, encoding?: string): Uint8Array | string => {
+  if (encoding && encoding !== 'buffer') return encodeBytes(bytes, encoding);
+  return bytesToBuffer(bytes);
+};
+
+const hostBytes = (value: unknown): Uint8Array => (value instanceof Uint8Array ? value : Uint8Array.from(value as number[]));
+
+const rsaSubtleDer = (key: KeyObject): Uint8Array => {
+  if (key.details?.keyType !== 'rsa-pss') return key.der;
+  const material = keyMaterial(key.der, key.type === 'public' ? 'public' : 'private');
+  return key.type === 'public' ? pkcs1PublicToSpki(material) : pkcs1PrivateToPkcs8(material);
+};
+
+const resolveSaltLength = (key: KeyObject, hash: string, saltLength: number | undefined, signing: boolean): number[] => {
+  const hashLength = HASH_LENGTHS[hash] ?? 32;
+  const max = Math.ceil((key.details?.modulusLength ?? 2048) / 8) - hashLength - 2;
+  if (saltLength === undefined || saltLength === constants.RSA_PSS_SALTLEN_MAX_SIGN) return signing ? [max] : [max, hashLength];
+  if (saltLength === constants.RSA_PSS_SALTLEN_DIGEST) return [hashLength];
+  return [saltLength];
+};
+
+const signWithKey = (algorithm: string | null | undefined, data: Uint8Array, keyInput: unknown): Uint8Array => {
+  const options = keyOptions(keyInput) as SignatureOptions;
+  const key = createPrivateKey(keyInput as never);
+  const info = key.details!;
+  if (info.keyType === 'ed25519' || info.keyType === 'ed448') {
+    return hostBytes(__call('crypto.sign', { algorithm: info.keyType, key: key.der, data, keyType: info.keyType }));
   }
-  return { bytes: raw, keyType, format };
+  const hash = inferHashFromAlgorithm(algorithm ?? 'sha256');
+  if (info.keyType === 'ec') {
+    const curve = getCurve(info.namedCurve!);
+    const p1363 = info.namedCurve === 'secp256k1'
+      ? ecdsaSign(curve, bigintFromBytes(ecPrivateScalar(key.der)), hashSync(hash, data))
+      : hostBytes(__call('crypto.sign', { algorithm: hash, key: key.der, data, keyType: 'ec', namedCurve: info.namedCurve, hash }));
+    return options.dsaEncoding === 'ieee-p1363' ? p1363 : p1363ToDer(p1363);
+  }
+  if (info.keyType === 'rsa' || info.keyType === 'rsa-pss') {
+    const pss = info.keyType === 'rsa-pss' || options.padding === constants.RSA_PKCS1_PSS_PADDING;
+    const saltLength = pss ? resolveSaltLength(key, hash, options.saltLength, true)[0] : undefined;
+    return hostBytes(__call('crypto.sign', {
+      algorithm: hash, key: rsaSubtleDer(key), data, keyType: pss ? 'rsa-pss' : 'rsa', hash,
+      ...(saltLength !== undefined ? { saltLength } : {}),
+    }));
+  }
+  throw codes.ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE!(info.keyType, 'rsa, rsa-pss, ec, ed25519 or ed448');
+};
+
+const verifyWithKey = (algorithm: string | null | undefined, data: Uint8Array, keyInput: unknown, signature: Uint8Array): boolean => {
+  const options = keyOptions(keyInput) as SignatureOptions;
+  const key = createPublicKey(keyInput as never);
+  const info = key.details!;
+  if (info.keyType === 'ed25519' || info.keyType === 'ed448') {
+    return __call('crypto.verify', { key: key.der, data, signature, keyType: info.keyType }) === true;
+  }
+  const hash = inferHashFromAlgorithm(algorithm ?? 'sha256');
+  if (info.keyType === 'ec') {
+    const curve = getCurve(info.namedCurve!);
+    let p1363: Uint8Array;
+    try { p1363 = options.dsaEncoding === 'ieee-p1363' ? signature : derToP1363(signature, curve.size); } catch { return false; }
+    if (info.namedCurve === 'secp256k1') return ecdsaVerify(curve, keyMaterial(key.der, 'public'), hashSync(hash, data), p1363);
+    return __call('crypto.verify', { key: key.der, data, signature: p1363, keyType: 'ec', namedCurve: info.namedCurve, hash }) === true;
+  }
+  if (info.keyType === 'rsa' || info.keyType === 'rsa-pss') {
+    const pss = info.keyType === 'rsa-pss' || options.padding === constants.RSA_PKCS1_PSS_PADDING;
+    const candidates = pss ? resolveSaltLength(key, hash, options.saltLength, false) : [undefined];
+    return candidates.some((saltLength) => __call('crypto.verify', {
+      key: rsaSubtleDer(key), data, signature, keyType: pss ? 'rsa-pss' : 'rsa', hash,
+      ...(saltLength !== undefined ? { saltLength } : {}),
+    }) === true);
+  }
+  throw codes.ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE!(info.keyType, 'rsa, rsa-pss, ec, ed25519 or ed448');
+};
+
+const concatChunks = (chunks: Uint8Array[]): Uint8Array => {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) { out.set(c, offset); offset += c.length; }
+  return out;
 };
 
 export class Sign {
@@ -721,29 +826,7 @@ export class Sign {
   }
 
   sign(key: unknown, outputEncoding?: string): Uint8Array | string {
-    let total = 0;
-    for (const c of this._chunks) total += c.length;
-    const data = new Uint8Array(total);
-    let off = 0;
-    for (const c of this._chunks) { data.set(c, off); off += c.length; }
-    const km = extractKeyMaterial(key, true);
-    const inferredType = inferKeyTypeFromAlgorithm(this._alg);
-    const keyType = km.keyType !== 'rsa' ? km.keyType : inferredType;
-    const hash = inferHashFromAlgorithm(this._alg);
-    const sig = __call('crypto.sign', {
-      algorithm: this._alg,
-      key: Array.from(km.bytes),
-      data: Array.from(data),
-      keyType,
-      hash,
-    }) as number[];
-    const out = Uint8Array.from(sig);
-    if (outputEncoding) {
-      const g = globalThis as Record<string, unknown>;
-      const Buffer = g['Buffer'] as undefined | { from(b: Uint8Array): { toString(e: string): string } };
-      if (Buffer) return Buffer.from(out).toString(outputEncoding);
-    }
-    return bytesToBuffer(out);
+    return outputBytes(signWithKey(this._alg, concatChunks(this._chunks), key), outputEncoding);
   }
 }
 
@@ -761,112 +844,395 @@ export class Verify {
   }
 
   verify(key: unknown, signature: unknown, sigEncoding?: string): boolean {
-    let total = 0;
-    for (const c of this._chunks) total += c.length;
-    const data = new Uint8Array(total);
-    let off = 0;
-    for (const c of this._chunks) { data.set(c, off); off += c.length; }
-    const sigBytes = toBytes(signature, sigEncoding ?? 'utf8');
-    const km = extractKeyMaterial(key, false);
-    const inferredType = inferKeyTypeFromAlgorithm(this._alg);
-    const keyType = km.keyType !== 'rsa' ? km.keyType : inferredType;
-    const hash = inferHashFromAlgorithm(this._alg);
-    return __call('crypto.verify', {
-      key: Array.from(km.bytes),
-      data: Array.from(data),
-      signature: Array.from(sigBytes),
-      keyType,
-      hash,
-    }) as boolean;
+    return verifyWithKey(this._alg, concatChunks(this._chunks), key, toBytes(signature, sigEncoding ?? 'utf8'));
   }
 }
 
 export const createSign = (alg: string): Sign => new Sign(alg);
 export const createVerify = (alg: string): Verify => new Verify(alg);
 
-// ---- generateKeyPair ----
+export const sign = (
+  algorithm: string | null | undefined, data: unknown, key: unknown,
+  callback?: (error: Error | null, signature?: Uint8Array) => void,
+): Uint8Array | undefined => {
+  if (!callback) return bytesToBuffer(signWithKey(algorithm, toBytes(data), key));
+  Promise.resolve().then(() => {
+    let signature: Uint8Array;
+    try { signature = bytesToBuffer(signWithKey(algorithm, toBytes(data), key)); } catch (error) { callback(error as Error); return; }
+    callback(null, signature);
+  });
+  return undefined;
+};
+
+export const verify = (
+  algorithm: string | null | undefined, data: unknown, key: unknown, signature: unknown,
+  callback?: (error: Error | null, result?: boolean) => void,
+): boolean | undefined => {
+  if (!callback) return verifyWithKey(algorithm, toBytes(data), key, toBytes(signature));
+  Promise.resolve().then(() => {
+    let result: boolean;
+    try { result = verifyWithKey(algorithm, toBytes(data), key, toBytes(signature)); } catch (error) { callback(error as Error); return; }
+    callback(null, result);
+  });
+  return undefined;
+};
 
 export interface GenerateKeyPairOptions {
   modulusLength?: number;
   publicExponent?: number;
   namedCurve?: string;
   hash?: string;
-  publicKeyEncoding?: { type?: string; format?: 'pem' | 'der' };
-  privateKeyEncoding?: { type?: string; format?: 'pem' | 'der' };
+  hashAlgorithm?: string;
+  publicKeyEncoding?: { type?: string; format?: string };
+  privateKeyEncoding?: { type?: string; format?: string; cipher?: string; passphrase?: unknown };
 }
 
-const wrapPem = (header: string, der: Uint8Array): string => {
-  const g = globalThis as Record<string, unknown>;
-  const Buffer = g['Buffer'] as undefined | { from(b: Uint8Array): { toString(e: string): string } };
-  let b64: string;
-  if (Buffer) b64 = Buffer.from(der).toString('base64');
-  else {
-    let s = '';
-    for (let i = 0; i < der.length; i++) s += String.fromCharCode(der[i]!);
-    b64 = btoa(s);
-  }
-  const lines: string[] = [];
-  for (let i = 0; i < b64.length; i += 64) lines.push(b64.slice(i, i + 64));
-  return `-----BEGIN ${header}-----\n${lines.join('\n')}\n-----END ${header}-----\n`;
+const SUBTLE_CURVE: Record<string, string> = { prime256v1: 'P-256', secp384r1: 'P-384', secp521r1: 'P-521' };
+
+const toPssKeyPair = (pair: { publicKey: KeyObject; privateKey: KeyObject }): { publicKey: KeyObject; privateKey: KeyObject } => {
+  const algorithm = sequence(encodeOid(OID.rsaPss));
+  const spki = sequence(algorithm, bitString(keyMaterial(pair.publicKey.der, 'public')));
+  const pkcs8 = sequence(integer(0n), algorithm, octetString(keyMaterial(pair.privateKey.der, 'private')));
+  return keyPairFromDer(spki, pkcs8);
 };
 
-const encodeKey = (kind: 'public' | 'private', der: Uint8Array, encoding: { type?: string; format?: 'pem' | 'der' } | undefined): Uint8Array | string => {
-  if (!encoding || encoding.format === 'der') return bytesToBuffer(der);
-  if (encoding.format === 'pem') {
-    const header = kind === 'public' ? 'PUBLIC KEY' : 'PRIVATE KEY';
-    return wrapPem(header, der);
+const generateKeyObjects = (type: string, options: GenerateKeyPairOptions): { publicKey: KeyObject; privateKey: KeyObject } => {
+  const kind = type.toLowerCase();
+  if (kind === 'rsa' || kind === 'rsa-pss') {
+    if (!options.modulusLength) throw codes.ERR_INVALID_ARG_VALUE!('options.modulusLength', options.modulusLength);
+    const hash = options.hashAlgorithm ?? options.hash;
+    const r = __call('crypto.generateKeyPair', {
+      type: kind,
+      modulusLength: options.modulusLength,
+      publicExponent: options.publicExponent ?? 65537,
+      hash: hash ? inferHashFromAlgorithm(hash) : 'SHA-256',
+    }) as { publicKey: Uint8Array; privateKey: Uint8Array };
+    const pair = keyPairFromDer(hostBytes(r.publicKey), hostBytes(r.privateKey));
+    return kind === 'rsa-pss' ? toPssKeyPair(pair) : pair;
   }
-  return bytesToBuffer(der);
+  if (kind === 'ec') {
+    const name = curveName(options.namedCurve ?? '');
+    if (!name) throw codes.ERR_INVALID_ARG_VALUE!('options.namedCurve', options.namedCurve);
+    if (!SUBTLE_CURVE[name]) return ecKeyPair(name);
+    const r = __call('crypto.generateKeyPair', { type: 'ec', namedCurve: SUBTLE_CURVE[name] }) as { publicKey: Uint8Array; privateKey: Uint8Array };
+    return keyPairFromDer(hostBytes(r.publicKey), hostBytes(r.privateKey));
+  }
+  if (kind === 'ed25519' || kind === 'ed448' || kind === 'x25519' || kind === 'x448') {
+    const r = __call('crypto.generateKeyPair', { type: kind }) as { publicKey: Uint8Array; privateKey: Uint8Array };
+    return keyPairFromDer(hostBytes(r.publicKey), hostBytes(r.privateKey));
+  }
+  throw codes.ERR_INVALID_ARG_VALUE!('type', type, `must be a supported key type`);
 };
 
-export const generateKeyPairSync = (
-  type: 'rsa' | 'rsa-pss' | 'ec' | 'ecdsa',
-  options: GenerateKeyPairOptions = {},
-): { publicKey: Uint8Array | string; privateKey: Uint8Array | string } => {
-  const r = __call('crypto.generateKeyPair', {
-    type,
-    modulusLength: options.modulusLength,
-    namedCurve: options.namedCurve,
-    hash: options.hash,
-  }) as { publicKey: number[]; privateKey: number[] };
-  const pubDer = Uint8Array.from(r.publicKey);
-  const privDer = Uint8Array.from(r.privateKey);
+export const generateKeyPairSync = (type: string, options: GenerateKeyPairOptions = {}): { publicKey: unknown; privateKey: unknown } => {
+  const pair = generateKeyObjects(type, options);
   return {
-    publicKey: encodeKey('public', pubDer, options.publicKeyEncoding),
-    privateKey: encodeKey('private', privDer, options.privateKeyEncoding),
+    publicKey: options.publicKeyEncoding ? pair.publicKey.export(options.publicKeyEncoding) : pair.publicKey,
+    privateKey: options.privateKeyEncoding ? pair.privateKey.export(options.privateKeyEncoding) : pair.privateKey,
   };
 };
 
 export const generateKeyPair = (
-  type: 'rsa' | 'rsa-pss' | 'ec' | 'ecdsa',
+  type: string,
   optsOrCb: GenerateKeyPairOptions | Function,
   maybeCb?: Function,
 ): void => {
   const cb = (typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as
-    | ((e: Error | null, publicKey?: Uint8Array | string, privateKey?: Uint8Array | string) => void)
+    | ((e: Error | null, publicKey?: unknown, privateKey?: unknown) => void)
     | undefined;
   const options = (typeof optsOrCb === 'object' && optsOrCb !== null ? optsOrCb as GenerateKeyPairOptions : {});
   if (!cb) throw codes.ERR_INVALID_CALLBACK!(cb);
   Promise.resolve().then(() => {
-    try {
-      const kp = generateKeyPairSync(type, options);
-      cb(null, kp.publicKey, kp.privateKey);
-    } catch (e) {
-      cb(e as Error);
-    }
+    let kp: { publicKey: unknown; privateKey: unknown };
+    try { kp = generateKeyPairSync(type, options); } catch (e) { cb(e as Error); return; }
+    cb(null, kp.publicKey, kp.privateKey);
   });
 };
 
-// ---- getCiphers / getHashes (informational) ----
+export const generateKeySync = (type: string, options: { length: number }): KeyObject => {
+  const length = options?.length;
+  if (type === 'hmac') {
+    if (!Number.isInteger(length) || length < 8 || length > 2 ** 31 - 1) throw codes.ERR_OUT_OF_RANGE!('options.length', '>= 8 && <= 2147483647', length);
+  } else if (type === 'aes') {
+    if (length !== 128 && length !== 192 && length !== 256) throw codes.ERR_INVALID_ARG_VALUE!('options.length', length, 'must be one of: 128, 192, 256');
+  } else {
+    throw codes.ERR_INVALID_ARG_VALUE!('type', type, "must be a supported key type");
+  }
+  const bytes = new Uint8Array(Math.floor(length / 8));
+  getRandomValues(bytes);
+  return createSecretKey(bytes);
+};
+
+export const generateKey = (type: string, options: { length: number }, callback: (error: Error | null, key?: KeyObject) => void): void => {
+  if (typeof callback !== 'function') throw codes.ERR_INVALID_CALLBACK!(callback);
+  Promise.resolve().then(() => {
+    let key: KeyObject;
+    try { key = generateKeySync(type, options); } catch (error) { callback(error as Error); return; }
+    callback(null, key);
+  });
+};
+
+export const hkdfSync = (digest: string, ikm: unknown, salt: unknown, info: unknown, keylen: number): ArrayBuffer => {
+  const keyBytes = ikm instanceof KeyObject ? ikm.der : toBytes(ikm);
+  const saltBytes = toBytes(salt);
+  const infoBytes = toBytes(info);
+  const hashLength = hashSync(digest, new Uint8Array(0)).length;
+  if (!Number.isInteger(keylen) || keylen < 0 || keylen > 255 * hashLength) throw codes.ERR_CRYPTO_INVALID_KEYLEN!(keylen);
+  if (infoBytes.length > 1024) throw codes.ERR_OUT_OF_RANGE!('info', 'must not contain more than 1024 bytes', infoBytes.length);
+  const mac = (key: Uint8Array, data: Uint8Array): Uint8Array => toBytes(new Hmac(digest, key).update(data).digest());
+  const prk = mac(saltBytes.length > 0 ? saltBytes : new Uint8Array(hashLength), keyBytes);
+  const out = new Uint8Array(keylen);
+  let previous: Uint8Array = new Uint8Array(0);
+  for (let offset = 0, counter = 1; offset < keylen; counter++) {
+    const block = new Uint8Array(previous.length + infoBytes.length + 1);
+    block.set(previous, 0);
+    block.set(infoBytes, previous.length);
+    block[block.length - 1] = counter;
+    previous = mac(prk, block);
+    out.set(previous.subarray(0, Math.min(previous.length, keylen - offset)), offset);
+    offset += previous.length;
+  }
+  return out.buffer;
+};
+
+export const hkdf = (
+  digest: string, ikm: unknown, salt: unknown, info: unknown, keylen: number,
+  callback: (error: Error | null, derivedKey?: ArrayBuffer) => void,
+): void => {
+  if (typeof callback !== 'function') throw codes.ERR_INVALID_CALLBACK!(callback);
+  Promise.resolve().then(() => {
+    let key: ArrayBuffer;
+    try { key = hkdfSync(digest, ikm, salt, info, keylen); } catch (error) { callback(error as Error); return; }
+    callback(null, key);
+  });
+};
+
+export const hash = (algorithm: string, data: unknown, outputEncoding: string = 'hex'): Uint8Array | string => {
+  if (typeof data !== 'string' && !ArrayBuffer.isView(data)) throw codes.ERR_INVALID_ARG_TYPE!('data', ['string', 'Buffer', 'TypedArray', 'DataView'], data);
+  return outputBytes(hashSync(algorithm, toBytes(data)), outputEncoding);
+};
+
+const inputBytes = (value: unknown, encoding?: string): Uint8Array => (typeof value === 'string' ? toBytes(value, encoding ?? 'utf8') : toBytes(value));
+
+export class ECDH {
+  private readonly curve: Curve;
+  private privateScalar: bigint | undefined;
+  private publicBytes: Uint8Array | undefined;
+
+  constructor(curve: string) {
+    this.curve = getCurve(curve);
+  }
+
+  static convertKey(key: unknown, curve: string, inputEncoding?: string, outputEncoding?: string, format: 'uncompressed' | 'compressed' | 'hybrid' = 'uncompressed'): Uint8Array | string {
+    const c = getCurve(curve);
+    return outputBytes(encodePoint(c, decodePoint(c, inputBytes(key, inputEncoding)), format), outputEncoding);
+  }
+
+  generateKeys(encoding?: string, format?: 'uncompressed' | 'compressed' | 'hybrid'): Uint8Array | string {
+    this.privateScalar = randomScalar(this.curve);
+    this.publicBytes = encodePoint(this.curve, publicPoint(this.curve, this.privateScalar));
+    return this.getPublicKey(encoding, format);
+  }
+
+  computeSecret(otherPublicKey: unknown, inputEncoding?: string, outputEncoding?: string): Uint8Array | string {
+    if (this.privateScalar === undefined) throw codes.ERR_CRYPTO_INVALID_STATE!('computeSecret');
+    let secret: Uint8Array;
+    try {
+      secret = sharedSecret(this.curve, this.privateScalar, inputBytes(otherPublicKey, inputEncoding));
+    } catch {
+      const error = new Error('Public key is not valid for specified curve');
+      (error as Error & { code?: string }).code = 'ERR_CRYPTO_ECDH_INVALID_PUBLIC_KEY';
+      throw error;
+    }
+    return outputBytes(secret, outputEncoding);
+  }
+
+  getPublicKey(encoding?: string, format: 'uncompressed' | 'compressed' | 'hybrid' = 'uncompressed'): Uint8Array | string {
+    if (!this.publicBytes) throw codes.ERR_CRYPTO_INVALID_STATE!('getPublicKey');
+    const bytes = format === 'uncompressed' ? this.publicBytes : encodePoint(this.curve, decodePoint(this.curve, this.publicBytes), format);
+    return outputBytes(bytes, encoding);
+  }
+
+  getPrivateKey(encoding?: string): Uint8Array | string {
+    if (this.privateScalar === undefined) throw codes.ERR_CRYPTO_INVALID_STATE!('getPrivateKey');
+    return outputBytes(bytesFromBigint(this.privateScalar, this.curve.size), encoding);
+  }
+
+  setPrivateKey(key: unknown, encoding?: string): this {
+    const d = bigintFromBytes(inputBytes(key, encoding));
+    if (d <= 0n || d >= this.curve.n) {
+      const error = new Error('Private key is not valid for specified curve.');
+      (error as Error & { code?: string }).code = 'ERR_CRYPTO_INVALID_KEYTYPE';
+      throw error;
+    }
+    this.privateScalar = d;
+    this.publicBytes = encodePoint(this.curve, publicPoint(this.curve, d));
+    return this;
+  }
+
+  setPublicKey(key: unknown, encoding?: string): this {
+    this.publicBytes = encodePoint(this.curve, decodePoint(this.curve, inputBytes(key, encoding)));
+    return this;
+  }
+}
+
+export const createECDH = (curve: string): ECDH => new ECDH(curve);
+
+const millerRabin = (n: bigint, rounds = 24): boolean => {
+  if (n < 2n) return false;
+  for (const p of [2n, 3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n, 37n]) {
+    if (n === p) return true;
+    if (n % p === 0n) return false;
+  }
+  let d = n - 1n;
+  let r = 0;
+  while ((d & 1n) === 0n) { d >>= 1n; r++; }
+  const bytes = new Uint8Array(Math.ceil(n.toString(2).length / 8) + 8);
+  for (let i = 0; i < rounds; i++) {
+    getRandomValues(bytes);
+    const a = 2n + (bigintFromBytes(bytes) % (n - 3n));
+    let x = modPow(a, d, n);
+    if (x === 1n || x === n - 1n) continue;
+    let composite = true;
+    for (let j = 1; j < r; j++) {
+      x = (x * x) % n;
+      if (x === n - 1n) { composite = false; break; }
+    }
+    if (composite) return false;
+  }
+  return true;
+};
+
+const randomPrime = (bits: number): bigint => {
+  const bytes = new Uint8Array(Math.ceil(bits / 8));
+  while (true) {
+    getRandomValues(bytes);
+    let candidate = bigintFromBytes(bytes) & ((1n << BigInt(bits)) - 1n);
+    candidate |= (1n << BigInt(bits - 1)) | 1n;
+    if (millerRabin(candidate)) return candidate;
+  }
+};
+
+export class DiffieHellman {
+  private readonly prime: bigint;
+  private readonly generator: bigint;
+  private privateValue: bigint | undefined;
+  private publicValue: bigint | undefined;
+  verifyError = 0;
+
+  constructor(prime: Uint8Array, generator: Uint8Array) {
+    this.prime = bigintFromBytes(prime);
+    this.generator = bigintFromBytes(generator);
+    if (this.generator < 2n) this.verifyError = constants.DH_NOT_SUITABLE_GENERATOR;
+  }
+
+  private size(): number {
+    return Math.ceil(this.prime.toString(2).length / 8);
+  }
+
+  generateKeys(encoding?: string): Uint8Array | string {
+    if (this.privateValue === undefined) {
+      const bytes = new Uint8Array(this.size());
+      do {
+        getRandomValues(bytes);
+        this.privateValue = bigintFromBytes(bytes) % (this.prime - 2n);
+      } while (this.privateValue < 2n);
+    }
+    this.publicValue = modPow(this.generator, this.privateValue, this.prime);
+    return this.getPublicKey(encoding);
+  }
+
+  computeSecret(otherPublicKey: unknown, inputEncoding?: string, outputEncoding?: string): Uint8Array | string {
+    if (this.privateValue === undefined) throw codes.ERR_CRYPTO_INVALID_STATE!('computeSecret');
+    const other = bigintFromBytes(inputBytes(otherPublicKey, inputEncoding));
+    if (other <= 1n || other >= this.prime - 1n) {
+      const error = new Error('Supplied key is too small');
+      (error as Error & { code?: string }).code = 'ERR_CRYPTO_INVALID_KEYLEN';
+      throw error;
+    }
+    return outputBytes(bytesFromBigint(modPow(other, this.privateValue, this.prime), this.size()), outputEncoding);
+  }
+
+  getPrime(encoding?: string): Uint8Array | string { return outputBytes(bytesFromBigint(this.prime), encoding); }
+  getGenerator(encoding?: string): Uint8Array | string { return outputBytes(bytesFromBigint(this.generator), encoding); }
+
+  getPublicKey(encoding?: string): Uint8Array | string {
+    if (this.publicValue === undefined) throw codes.ERR_CRYPTO_INVALID_STATE!('getPublicKey');
+    return outputBytes(bytesFromBigint(this.publicValue, this.size()), encoding);
+  }
+
+  getPrivateKey(encoding?: string): Uint8Array | string {
+    if (this.privateValue === undefined) throw codes.ERR_CRYPTO_INVALID_STATE!('getPrivateKey');
+    return outputBytes(bytesFromBigint(this.privateValue), encoding);
+  }
+
+  setPublicKey(key: unknown, encoding?: string): void { this.publicValue = bigintFromBytes(inputBytes(key, encoding)); }
+  setPrivateKey(key: unknown, encoding?: string): void {
+    this.privateValue = bigintFromBytes(inputBytes(key, encoding));
+    this.publicValue = modPow(this.generator, this.privateValue, this.prime);
+  }
+}
+
+export const createDiffieHellman = (primeOrLength: unknown, primeEncodingOrGenerator?: unknown, generator?: unknown, generatorEncoding?: string): DiffieHellman => {
+  const toGenerator = (value: unknown, encoding?: string): Uint8Array => {
+    if (value === undefined) return new Uint8Array([2]);
+    if (typeof value === 'number') return bytesFromBigint(BigInt(value));
+    return inputBytes(value, encoding);
+  };
+  if (typeof primeOrLength === 'number') {
+    if (!Number.isInteger(primeOrLength) || primeOrLength < 2) throw codes.ERR_OUT_OF_RANGE!('primeLength', '>= 2', primeOrLength);
+    return new DiffieHellman(bytesFromBigint(randomPrime(primeOrLength)), toGenerator(primeEncodingOrGenerator));
+  }
+  if (typeof primeEncodingOrGenerator === 'string' && typeof primeOrLength === 'string') {
+    return new DiffieHellman(inputBytes(primeOrLength, primeEncodingOrGenerator), toGenerator(generator, generatorEncoding));
+  }
+  return new DiffieHellman(inputBytes(primeOrLength), toGenerator(primeEncodingOrGenerator ?? generator, generatorEncoding));
+};
+
+export const getDiffieHellman = (groupName: string): DiffieHellman => {
+  const prime = MODP_GROUPS[groupName];
+  if (!prime) {
+    const error = new Error('Unknown DH group');
+    (error as Error & { code?: string }).code = 'ERR_CRYPTO_UNKNOWN_DH_GROUP';
+    throw error;
+  }
+  return new DiffieHellman(bytesFromBigint(BigInt('0x' + prime)), new Uint8Array([2]));
+};
+
+export const createDiffieHellmanGroup = getDiffieHellman;
+export const DiffieHellmanGroup = DiffieHellman;
+
+export const diffieHellman = (options: { privateKey: KeyObject; publicKey: KeyObject }): Uint8Array => {
+  const { privateKey, publicKey } = options;
+  if (!(privateKey instanceof KeyObject) || privateKey.type !== 'private') throw codes.ERR_INVALID_ARG_TYPE!('options.privateKey', 'KeyObject', privateKey);
+  if (!(publicKey instanceof KeyObject) || publicKey.type !== 'public') throw codes.ERR_INVALID_ARG_TYPE!('options.publicKey', 'KeyObject', publicKey);
+  const ours = privateKey.details!;
+  const theirs = publicKey.details!;
+  if (ours.keyType !== theirs.keyType || ours.namedCurve !== theirs.namedCurve) {
+    const error = new Error('Incompatible key types for Diffie-Hellman');
+    (error as Error & { code?: string }).code = 'ERR_CRYPTO_INCOMPATIBLE_KEY';
+    throw error;
+  }
+  if (ours.keyType === 'ec') {
+    const curve = getCurve(ours.namedCurve!);
+    return bytesToBuffer(sharedSecret(curve, bigintFromBytes(ecPrivateScalar(privateKey.der)), keyMaterial(publicKey.der, 'public')));
+  }
+  if (ours.keyType === 'x25519' || ours.keyType === 'x448') {
+    return bytesToBuffer(hostBytes(__call('crypto.okp.deriveBits', { keyType: ours.keyType, privateKey: privateKey.der, publicKey: publicKey.der })));
+  }
+  const error = new Error(`Diffie-Hellman is not supported for ${ours.keyType} keys`);
+  (error as Error & { code?: string }).code = 'ERR_CRYPTO_INCOMPATIBLE_KEY';
+  throw error;
+};
 
 export const getHashes = (): string[] => ['md5', 'sha1', 'sha256', 'sha384', 'sha512'];
-export const getCiphers = (): string[] => ['aes-128-cbc', 'aes-256-cbc', 'aes-128-gcm', 'aes-256-gcm'];
-
-// ---- webcrypto passthrough ----
+export const getCiphers = (): string[] => Object.keys(SUBTLE_CIPHER_MAP);
+export const getCurves = (): string[] => ['prime256v1', 'secp256k1', 'secp384r1', 'secp521r1'];
 
 export const webcrypto = (typeof crypto !== 'undefined' ? crypto : undefined);
+export const subtle = webcrypto?.subtle;
 
-export const constants = Object.freeze({});
+export { KeyObject, createPrivateKey, createPublicKey, createSecretKey };
 
 export const nodeCrypto = {
   randomBytes,
@@ -880,10 +1246,13 @@ export const nodeCrypto = {
   Hmac,
   createHash,
   createHmac,
+  hash,
   pbkdf2,
   pbkdf2Sync,
   scrypt,
   scryptSync,
+  hkdf,
+  hkdfSync,
   Cipher,
   Decipher,
   createCipheriv,
@@ -892,10 +1261,28 @@ export const nodeCrypto = {
   Verify,
   createSign,
   createVerify,
+  sign,
+  verify,
+  KeyObject,
+  createPrivateKey,
+  createPublicKey,
+  createSecretKey,
+  generateKey,
+  generateKeySync,
   generateKeyPair,
   generateKeyPairSync,
+  ECDH,
+  createECDH,
+  DiffieHellman,
+  DiffieHellmanGroup,
+  createDiffieHellman,
+  createDiffieHellmanGroup,
+  getDiffieHellman,
+  diffieHellman,
   getHashes,
   getCiphers,
+  getCurves,
   webcrypto,
+  subtle,
   constants,
 };

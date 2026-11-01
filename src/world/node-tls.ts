@@ -46,11 +46,24 @@ const bytes = (chunk: unknown): Uint8Array => {
   throw new TypeError('TLS socket writes must be strings or Uint8Array instances');
 };
 
+export class SecureContext {
+  readonly context: Record<string, unknown> = {};
+}
+
+export const createSecureContext = (options: Record<string, unknown> = {}): SecureContext => {
+  for (const name of UNSUPPORTED_OPTIONS) {
+    if (options[name] !== undefined) throw new Error(`browser TLS does not support ${name}`);
+  }
+  return new SecureContext();
+};
+
 const unsupportedOptions = (options: TLSConnectOptions): void => {
   for (const name of Object.keys(options)) {
+    if (name === 'secureContext' && options[name] instanceof SecureContext) continue;
     if (!SUPPORTED_OPTIONS.has(name)) throw new Error(`browser TLS does not support ${name}`);
   }
   for (const name of UNSUPPORTED_OPTIONS) {
+    if (name === 'secureContext' && options[name] instanceof SecureContext) continue;
     if (options[name] !== undefined) throw new Error(`browser TLS does not support ${name}`);
   }
 };
@@ -313,4 +326,4 @@ export const createServer = (options: TlsServerOptions, listener?: (socket: Sock
     return new Server(serverOptions(options), listener);
   };
 
-export const nodeTls = { TLSSocket, Server, connect, createServer };
+export const nodeTls = { TLSSocket, Server, SecureContext, connect, createServer, createSecureContext };

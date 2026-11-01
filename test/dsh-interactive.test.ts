@@ -172,34 +172,34 @@ test('dsh interactive: ancestor node_modules bin remains first after cd into a n
   expect(await j.waitFor('/home/dusk/node_modules/.bin/tar')).toBe(true);
   await j.send('tar');
   expect(await j.waitFor('ancestor-tar')).toBe(true);
-  await j.send('which zip || echo zip-not-found');
-  expect(await j.waitFor('zip-not-found')).toBe(true);
-  await j.send('which unzip || echo unzip-not-found');
-  expect(await j.waitFor('unzip-not-found')).toBe(true);
+  await j.send('which rar || echo rar-not-found');
+  expect(await j.waitFor('rar-not-found')).toBe(true);
+  await j.send('which unzip');
+  expect(await j.waitFor('/bin/unzip')).toBe(true);
   expect(j.stdoutBuf()).not.toContain('command not available in browser environments');
   await j.cleanup();
 }, 60_000);
 
-test('dsh interactive: DPM /usr/bin tar shim runs before browser exclusion', async () => {
+test('dsh interactive: DPM /usr/bin shim runs before browser exclusion', async () => {
   const j = await startJsh({
     path: '/usr/bin:/bin',
     setup: async (fs) => {
       await fs.mkdir('/usr/bin', { recursive: true });
-      await fs.writeFile('/usr/bin/tar', 'echo dpm-tar\n');
+      await fs.writeFile('/usr/bin/xan', 'echo dpm-xan\n');
     },
   });
   await j.waitFor('dsh$ ');
-  await j.send('tar');
-  expect(await j.waitFor('dpm-tar')).toBe(true);
+  await j.send('xan');
+  expect(await j.waitFor('dpm-xan')).toBe(true);
   expect(j.stdoutBuf()).not.toContain('command not available in browser environments');
   await j.cleanup();
 }, 60_000);
 
-test('dsh interactive: absent tar emits the unsupported command message', async () => {
+test('dsh interactive: tar is available without a shim', async () => {
   const j = await startJsh({ path: '/usr/bin:/bin' });
   await j.waitFor('dsh$ ');
-  await j.send('tar');
-  expect(await j.waitFor('tar: not supported in DuskJS engine')).toBe(true);
+  await j.send('tar --help');
+  expect(await j.waitFor('Usage: tar')).toBe(true);
   await j.cleanup();
 }, 60_000);
 

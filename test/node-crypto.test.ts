@@ -52,3 +52,21 @@ test('node:crypto randomBytes, sha256(hello), hmac sha1, timingSafeEqual, random
   expect(s).toContain('uuidLen=36');
   expect(s).toContain('uuidShape=true');
 }, 60_000);
+
+test('node:crypto scrypt matches RFC 7914 vectors and rejects bad parameters', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  await repl.feed(
+    "const crypto = require('node:crypto'); " +
+    "const a = crypto.scryptSync('password', 'NaCl', 64, { N: 1024, r: 8, p: 16 }).toString('hex'); " +
+    "const b = crypto.scryptSync('', '', 64, { N: 16, r: 1, p: 1 }).toString('hex'); " +
+    "let badN = ''; try { crypto.scryptSync('x', 'y', 16, { N: 3 }); } catch (e) { badN = e.code; } " +
+    "let mem = ''; try { crypto.scryptSync('x', 'y', 16, { N: 1 << 20, r: 8 }); } catch (e) { mem = e.code; } " +
+    "crypto.scrypt('x', 'y', 16, { N: 16, r: 1, p: 1 }, (err, key) => { " +
+    "process.stdout.write('S:' + a.slice(0, 32) + '|' + b.slice(0, 32) + '|' + badN + '|' + mem + '|async=' + (err === null && key.length === 16) + ':END'); });"
+  );
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  repl.engine.terminate();
+  const s = out.join('');
+  expect(s).toContain('S:fdbabe1c9d3472007856e7190d01e9fe|77d6576238657b203b19ca42c18a0497|ERR_CRYPTO_INVALID_SCRYPT_PARAMS|ERR_CRYPTO_INVALID_SCRYPT_PARAMS|async=true:END');
+}, 120_000);

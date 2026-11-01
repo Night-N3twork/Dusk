@@ -9,11 +9,17 @@ import { createWispTcpProvider, createWispTlsTcpProvider, type TcpProvider, type
 import type { RelayListenAuthorizer, TlsServerConnection } from './host/relay-tls-server';
 import { createMemoryBackend, createTfsBackend, type FSBackend } from './host/fs-backend';
 import { createLayoutBackend } from './host/fs-layout';
+import { createMountBackend } from './host/fs-mount';
+import { createFileSystemAccessBackend } from './host/fs-access';
+import { exportSnapshot, importSnapshot, type SnapshotExportOptions, type SnapshotImportOptions } from './host/snapshot';
 import { createPythonFuncs } from './host/python';
 import { loadDuskExtensions, type DuskExtensionHost } from './host/extensions';
 import { startRepl, type DuskRepl } from './repl/repl';
 import { createEngineFactory, type DuskRuntime, type EngineInstance, type FuncTable } from './host/engine-instance';
 import type { NativePackageReplacementEntries } from './host/native-package-registry';
+import type { DnsResolver } from './host/dns';
+import { toNetworkPolicy, type NetworkPolicy } from './host/network-policy';
+import type { ProcessLimits } from './host/process-manager';
 
 export { createRunner } from './host/runner';
 export { createEngine } from './host/engine-instance';
@@ -26,6 +32,11 @@ export { createMemoryBackend, createTfsBackend } from './host/fs-backend';
 export type { FSBackend } from './host/fs-backend';
 export type { FuncTable } from './host/engine-instance';
 export { createLayoutBackend } from './host/fs-layout';
+export { createMountBackend } from './host/fs-mount';
+export type { MountableBackend } from './host/fs-mount';
+export { createFileSystemAccessBackend } from './host/fs-access';
+export { exportSnapshot, importSnapshot, snapshotFromUrl, snapshotToUrl } from './host/snapshot';
+export type { SnapshotExportOptions, SnapshotImportOptions } from './host/snapshot';
 export { createRelayTlsServer } from './host/relay-tls-server';
 export type { RelayListenAuthorizer, RelayListenRequest, RelayTlsPlaintextSocket, RelayTlsServer, RelayTlsServerOptions, TlsServerConnection } from './host/relay-tls-server';
 export { initEnginePool, isPoolWarm } from './host/engine-pool';
@@ -36,8 +47,19 @@ export { createTcpProvider, createWispTcpProvider, createWispTlsTcpProvider } fr
 export { loadDuskExtensions } from './host/extensions';
 export type { DuskExtensionHost, DuskExtensionManifest } from './host/extensions';
 export type { TcpOpenOptions, TcpProvider, TcpRelayAttachment, TcpStream, WispTlsTcpProviderOptions } from './host/tcp';
+export { createDohResolver } from './host/dns';
+export { createAllowList } from './host/network-policy';
+export { fetchLoopback, startPreview } from './host/preview';
+export type { LoopbackRequest, LoopbackResponse, PreviewHandle, PreviewOptions } from './host/preview';
+export type { LoopbackConnection } from './host/process-manager';
+export { default as previewServiceWorkerSource } from './preview/preview-sw.js?raw';
+export type { NetworkPolicy, NetworkTarget } from './host/network-policy';
+export type { ProcessLimits, ProcessManagerEventMap } from './host/process-manager';
+export type { DnsAnswer, DnsRecordType, DnsResolver } from './host/dns';
 
-export type BootReplNetOptions =
+export type BootReplNetOptions = BootReplNetTransportOptions & { dns?: DnsResolver; allow?: NetworkPolicy | readonly string[] };
+
+type BootReplNetTransportOptions =
   | { loadLibcurl: () => Promise<LibCurl>; proxyUrl: string; relay?: RelayListener & Partial<TcpRelayAttachment>; relayTls?: RelayTlsHostCapability; tcp?: boolean; tcpProvider?: TcpProvider }
   | { relay: RelayListener; relayTls?: RelayTlsHostCapability; loadLibcurl?: never; proxyUrl?: never; tcp?: boolean; tcpProvider?: TcpProvider }
   | { tcpProvider: TcpProvider; relay?: RelayListener & Partial<TcpRelayAttachment>; relayTls?: RelayTlsHostCapability; loadLibcurl?: never; proxyUrl?: never; tcp?: boolean };
@@ -80,6 +102,7 @@ export interface BootReplOptions {
   extensions?: readonly DuskExtensionHost[];
   /** Project whose DPM lockfile authorizes the requested extensions. */
   extensionCwd?: string;
+  limits?: ProcessLimits;
 }
 
 export interface BootReplResult extends DuskRepl {
@@ -91,6 +114,11 @@ export interface BootReplResult extends DuskRepl {
   /** Present when `via: 'node'` — the spawned /bin/node child handle. */
   node?: DuskProcessHandle;
   registerWispTransport(name: string, factory: unknown): void;
+  mount(path: string, target: FSBackend | FileSystemDirectoryHandle): void;
+  unmount(path: string): boolean;
+  exportSnapshot(options?: SnapshotExportOptions): Promise<Uint8Array>;
+  importSnapshot(data: Uint8Array, options?: SnapshotImportOptions): Promise<string[]>;
+  dispose(): Promise<void>;
 }
 
 export const bootRepl = async (
@@ -118,6 +146,7 @@ export const bootRepl = async (
   let net: NetHost | undefined;
   let cleanupNetworkForPid: ((pid: number) => void) | undefined;
   const netOptions = options?.net;
+  const networkPolicy = toNetworkPolicy(netOptions?.allow);
   const configuredRelay = netOptions?.relay;
   const tcpRelay = configuredRelay && typeof (configuredRelay as Partial<TcpRelayAttachment>).attach === 'function'
     ? configuredRelay as RelayListener & TcpRelayAttachment
@@ -139,6 +168,7 @@ export const bootRepl = async (
         else pm.dispatch(pid, js);
       },
       options.net.proxyUrl,
+      networkPolicy,
     );
     netFuncs = net.funcs;
     cleanupNetworkForPid = net.cleanupForPid;
@@ -149,6 +179,7 @@ export const bootRepl = async (
   };
 
   let backend: FSBackend;
+  let mountable: ReturnType<typeof createMountBackend>;
   const processManagerOptions = {
     ...(options?.net?.relay ? { relay: options.net.relay } : {}),
     ...(options?.net?.relayTls ? { relayTls: options.net.relayTls } : {}),
@@ -157,6 +188,9 @@ export const bootRepl = async (
     ...(net ? { dpmFetch: net.fetch, dpmFetchBytes: net.fetchBytes } : {}),
     ...(options?.nativePackageReplacements ? { nativePackageReplacements: options.nativePackageReplacements } : {}),
     ...(options?.ssh ? { ssh: options.ssh } : {}),
+    ...(options?.net?.dns ? { dns: options.net.dns } : {}),
+    ...(networkPolicy ? { networkPolicy } : {}),
+    ...(options?.limits ? { limits: options.limits } : {}),
   };
   // Host bridges get the same FSBackend the process manager sees.
   // We build them AFTER pm construction (see below) once `backend` is bound.
@@ -165,18 +199,30 @@ export const bootRepl = async (
     const ephemeral = createMemoryBackend();
     // Build pm with persistent first (so binaries get registered), then swap to layout
     pm = new ProcessManager(persistent, netFuncs, {}, { ...processManagerOptions, engineFactory });
-    backend = await createLayoutBackend({
+    mountable = createMountBackend(await createLayoutBackend({
       ephemeral,
       persistent,
       processManager: pm,
       user,
       hostname,
-    });
+    }));
+    backend = mountable;
     (pm as unknown as { fs: FSBackend }).fs = backend;
   } else {
-    backend = persistent;
+    mountable = createMountBackend(persistent);
+    backend = mountable;
     pm = new ProcessManager(backend, netFuncs, {}, { ...processManagerOptions, engineFactory });
   }
+  const files = {
+    mount: (path: string, target: FSBackend | FileSystemDirectoryHandle): void => {
+      mountable.mount(path, 'kind' in target && target.kind === 'directory'
+        ? createFileSystemAccessBackend(target as FileSystemDirectoryHandle)
+        : target as FSBackend);
+    },
+    unmount: (path: string): boolean => mountable.unmount(path),
+    exportSnapshot: (snapshotOptions?: SnapshotExportOptions): Promise<Uint8Array> => exportSnapshot(backend, snapshotOptions),
+    importSnapshot: (data: Uint8Array, snapshotOptions?: SnapshotImportOptions): Promise<string[]> => importSnapshot(backend, data, snapshotOptions),
+  };
   for (const [path, contents] of Object.entries(options?.seed ?? {})) {
     const segs = path.split('/').filter(Boolean);
     segs.pop();
@@ -224,6 +270,11 @@ export const bootRepl = async (
     engineHolder.engine = engine;
   }
 
+  const dispose = async (): Promise<void> => {
+    await pm.dispose();
+    if (engine.pid === 0) await engine.terminate().catch(() => 0);
+  };
+
   if (options?.via === 'node') {
     // Spawn /bin/node with no args → enters REPL mode. No PTY: readline goes via
     // proc.readStdin polling in main.ts's startRepl (see binaries/node/main.ts).
@@ -253,7 +304,7 @@ export const bootRepl = async (
     const feed = async (line: string): Promise<void> => {
       await nodeHandle.stdin.write(encoder.encode(line + '\n'));
     };
-    return { feed, processManager: pm, engine, node: nodeHandle, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport };
+    return { feed, processManager: pm, engine, node: nodeHandle, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport, ...files, dispose };
   }
 
   if (options?.skipPidZero) {
@@ -262,9 +313,9 @@ export const bootRepl = async (
     const feed = async (): Promise<void> => {
       throw new Error('bootRepl: feed() unavailable when skipPidZero:true. Spawn a shell via processManager.spawn(\'/bin/dsh\', ...) and write to its stdin.');
     };
-    return { feed, processManager: pm, engine, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport };
+    return { feed, processManager: pm, engine, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport, ...files, dispose };
   }
 
   const repl = startRepl(engine, write);
-  return { feed: repl.feed, processManager: pm, engine, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport };
+  return { feed: repl.feed, processManager: pm, engine, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport, ...files, dispose };
 };

@@ -262,7 +262,23 @@ const buildSyntheticDev = (): FSBackend => {
     },
     async rename(from: string): Promise<void> { throw erofs(from); },
   };
-  return { ...base, ...syntheticByteStubs(base) };
+  return {
+    ...base,
+    ...syntheticByteStubs(base),
+    async readFileBytes(path: string): Promise<Uint8Array> {
+      const n = norm(path);
+      if (n === '/random' || n === '/urandom') {
+        const bytes = new Uint8Array(32);
+        crypto.getRandomValues(bytes);
+        return bytes;
+      }
+      if (knownNames.has(n.replace(/^\//, ''))) return new Uint8Array(0);
+      throw enotEnt(path);
+    },
+    async writeFileBytes(path: string): Promise<void> {
+      if (!knownNames.has(norm(path).replace(/^\//, ''))) throw enotEnt(path);
+    },
+  };
 };
 
 export const createLayoutBackend = async (opts: LayoutOptions): Promise<FSBackend> => {

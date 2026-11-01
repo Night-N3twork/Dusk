@@ -21,9 +21,10 @@ test('published Dusk manifest is self-contained and depends on registry runtime 
   expect(releaseManifest.dependencies?.['@nightnetwork/dpm']).toBe('1.0.0');
   expect(releaseManifest.dependencies?.['@nightnetwork/moonbeam']).toBe('^1.1.1');
   expect(releaseManifest.dependencies?.['@nightnetwork/nova']).toBe('^1.1.0');
-  expect(releaseManifest.dependencies?.['fast-xml-parser']).toBe('^5.10.1');
-  expect(releaseManifest.dependencies?.minimatch).toBe('^10.2.6');
-  expect(releaseManifest.dependencies?.['smol-toml']).toBe('^1.9.0');
+  expect(Object.keys(releaseManifest.dependencies ?? {}).sort()).toEqual(['@nightnetwork/dpm', '@nightnetwork/moonbeam', '@nightnetwork/nova']);
+  expect(releaseManifest.devDependencies?.['fast-xml-parser']).toBe('^5.10.1');
+  expect(releaseManifest.devDependencies?.minimatch).toBe('^10.2.6');
+  expect(releaseManifest.devDependencies?.['smol-toml']).toBe('^1.9.0');
   expect(releaseManifest.devDependencies?.vitest).toBe('^4.1.11');
   expect(releaseManifest.devDependencies?.['@vitest/browser']).toBe('^4.1.11');
   expect(releaseManifest.devDependencies?.['@vitest/browser-playwright']).toBe('^4.1.11');

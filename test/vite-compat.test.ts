@@ -281,7 +281,7 @@ test('DPM routes the pinned Vite ESM bin through the ESM loader and executes its
 
     const directRequire = await repl.processManager.spawnSync('/bin/node', ['-e', 'require("/project/node_modules/vite/bin/vite.js")'], { cwd: '/project' });
     expect(directRequire.status).toBe(1);
-    expect(decode(directRequire.stderr)).toContain('ERR_REQUIRE_ESM: require() of ES Module /project/node_modules/vite/bin/vite.js is not supported');
+    expect(decode(directRequire.stderr)).toContain('ERR_REQUIRE_ASYNC_MODULE');
   } finally {
     await repl.engine.terminate();
   }
@@ -432,14 +432,14 @@ test('serves Vite 5.4.21 through the relay and broadcasts HMR for host mutations
   }
 }, 60_000);
 
-test('Vite node modules receive a default startupSnapshot adapter without exposing node:v8 globally', async () => {
+test('node:v8 exposes a startupSnapshot that reports no snapshot build', async () => {
   const repl = await bootRepl(() => {}, { fs: 'memory', skipPidZero: true });
   const fs = (repl.processManager as unknown as { fs: FSBackend }).fs;
 
   try {
     await fs.mkdir('/project/node_modules/vite/dist/node', { recursive: true });
     await fs.writeFile('/project/node_modules/vite/package.json', '{"type":"module"}\n');
-    await fs.writeFile('/project/node_modules/vite/dist/node/snapshot.mjs', "import startupSnapshot from 'node:v8'; export const building = startupSnapshot.isBuildingSnapshot();\n");
+    await fs.writeFile('/project/node_modules/vite/dist/node/snapshot.mjs', "import v8 from 'node:v8'; export const building = v8.startupSnapshot.isBuildingSnapshot();\n");
 
     const viteImport = await repl.processManager.spawnSync('/bin/node', [
       '--input-type=module',
@@ -449,13 +449,13 @@ test('Vite node modules receive a default startupSnapshot adapter without exposi
     expect(viteImport.status, decode(viteImport.stderr)).toBe(0);
     expect(decode(viteImport.stdout)).toBe('false\n');
 
-    const externalImport = await repl.processManager.spawnSync('/bin/node', [
+    const namedImport = await repl.processManager.spawnSync('/bin/node', [
       '--input-type=module',
       '-e',
-      '(async () => { let failure; import("node:v8").catch((error) => { failure = error; }); for (let i = 0; i < 20 && !failure; i++) await new Promise((resolve) => setTimeout(resolve, 10)); if (!failure) throw new Error("node:v8 unexpectedly loaded"); throw failure; })().catch((error) => { console.error(error.stack ?? error); process.exit(1); })',
+      '(async () => { const v8 = await import("node:v8"); process.stdout.write(String(v8.startupSnapshot.isBuildingSnapshot()) + "\\n"); })()',
     ], { cwd: '/project' });
-    expect(externalImport.status).toBe(1);
-    expect(decode(externalImport.stderr)).toContain('Cannot find module node:v8');
+    expect(namedImport.status, decode(namedImport.stderr)).toBe(0);
+    expect(decode(namedImport.stdout)).toBe('false\n');
   } finally {
     await repl.engine.terminate();
   }

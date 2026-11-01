@@ -5,8 +5,6 @@
 //   accessing them via `with`, then copy back. This is a leaky approximation,
 //   sufficient for template engines and config evaluators.
 
-const isPrim = (v: unknown): boolean => v === null || (typeof v !== 'object' && typeof v !== 'function');
-
 export interface RunOptions {
   filename?: string;
   lineOffset?: number;

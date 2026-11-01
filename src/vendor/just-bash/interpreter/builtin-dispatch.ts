@@ -60,7 +60,7 @@ import {
   handleCommandV as handleCommandVHelper,
   handleType as handleTypeHelper,
 } from "./type-command.js";
-import type { InterpreterContext } from "./types.js";
+import { isGroupStdinPending, type InterpreterContext } from "./types.js";
 
 /**
  * Type for the function that runs a command recursively
@@ -231,8 +231,15 @@ export async function dispatchBuiltin(
     const [cmd, ...rest] = args;
     return runCommand(cmd, rest, [], stdin, false, false, -1);
   }
+  const hooked = ctx.jobControl?.builtin?.(commandName, args);
+  if (hooked) {
+    return await hooked;
+  }
   if (commandName === "wait") {
-    // wait - wait for background jobs (stub: no-op in this context)
+    if (ctx.jobControl) {
+      const code = await ctx.jobControl.wait(args);
+      return code === 0 ? OK : failure("", code);
+    }
     return OK;
   }
   if (commandName === "type") {
@@ -421,9 +428,10 @@ export async function executeExternalCommand(
   // brand it. Commands that decode their input internally (sed, jq,
   // ...) return text via `textOutput()`, and the pipe / redirect layer
   // converts to bytes on their behalf.
-  const effectiveStdin = unsafeBytesFromLatin1(
-    stdin || ctx.state.groupStdin || "",
-  );
+  const lazyStdin = !stdin && isGroupStdinPending(ctx.state);
+  const effectiveStdin = lazyStdin
+    ? unsafeBytesFromLatin1("")
+    : unsafeBytesFromLatin1(stdin || ctx.state.groupStdin || "");
 
   // Build exported environment for commands that need it (printenv, env, etc.)
   // Most builtins need access to the full env to modify state
@@ -448,7 +456,20 @@ export async function executeExternalCommand(
     requireDefenseContext: ctx.requireDefenseContext,
     jsBootstrapCode: ctx.jsBootstrapCode,
     invokeTool: ctx.invokeTool,
+    terminal:
+      ctx.terminal && ctx.terminalDepth !== undefined && (ctx.captureDepth ?? 0) === ctx.terminalDepth
+        ? ctx.terminal
+        : undefined,
   };
+  if (lazyStdin) {
+    let loaded: ReturnType<typeof unsafeBytesFromLatin1> | undefined;
+    Object.defineProperty(cmdCtx, "stdin", {
+      configurable: true,
+      enumerable: true,
+      get: () => (loaded ??= unsafeBytesFromLatin1(ctx.state.groupStdin || "")),
+      set: (value) => { loaded = value; },
+    });
+  }
   const guardedCmdCtx = createDefenseAwareCommandContext(cmdCtx, commandName);
 
   try {

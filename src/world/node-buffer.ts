@@ -478,6 +478,10 @@ export class Buffer extends Uint8Array {
 
 export const nodeBuffer = {
   Buffer,
+  Blob: globalThis.Blob,
+  File: (globalThis as { File?: unknown }).File,
+  atob: globalThis.atob,
+  btoa: globalThis.btoa,
   default: Buffer,
   constants: {
     MAX_LENGTH: 0x7fffffff,

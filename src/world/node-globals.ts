@@ -41,6 +41,11 @@ export const installNodeGlobals = (): void => {
     exists: (path: string) => call('fs.exists', { path }),
     stat: (path: string) => call('fs.stat', { path }),
     rename: (from: string, to: string) => call('fs.rename', { from, to }),
+    readFileBytes: (path: string): Uint8Array => {
+      const value = call('fs.readFileBytes', { path });
+      return value instanceof Uint8Array ? value : Uint8Array.from(value as number[]);
+    },
+    writeFileBytes: (path: string, data: Uint8Array) => call('fs.writeFileBytes', { path, data }),
     appendFile: (path: string, data: string) => {
       // read-modify-write; TFS lacks a native append IPC
       let existing = '';

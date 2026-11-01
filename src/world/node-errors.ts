@@ -258,6 +258,7 @@ def('ERR_CRYPTO_INVALID_TAG_LENGTH', (len: unknown) => makeError(RangeError, 'ER
 def('ERR_CRYPTO_JOB_INIT_FAILED', () => makeError(Error, 'ERR_CRYPTO_JOB_INIT_FAILED', 'Crypto job init failed'));
 def('ERR_CRYPTO_JWK_UNSUPPORTED_CURVE', () => makeError(Error, 'ERR_CRYPTO_JWK_UNSUPPORTED_CURVE', 'Unsupported JWK curve'));
 def('ERR_CRYPTO_PBKDF2_ERROR', () => makeError(Error, 'ERR_CRYPTO_PBKDF2_ERROR', 'PBKDF2 error'));
+def('ERR_CRYPTO_INVALID_SCRYPT_PARAMS', (detail?: unknown) => makeError(RangeError, 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS', detail === undefined ? 'Invalid scrypt params' : `Invalid scrypt params: ${String(detail)}`));
 def('ERR_CRYPTO_SCRYPT_INVALID_PARAMETER', () => makeError(Error, 'ERR_CRYPTO_SCRYPT_INVALID_PARAMETER', 'Invalid scrypt parameter'));
 def('ERR_CRYPTO_SCRYPT_NOT_SUPPORTED', () => makeError(Error, 'ERR_CRYPTO_SCRYPT_NOT_SUPPORTED', 'Scrypt algorithm not supported'));
 def('ERR_CRYPTO_SIGN_KEY_REQUIRED', () => makeError(Error, 'ERR_CRYPTO_SIGN_KEY_REQUIRED', 'No key provided to sign'));

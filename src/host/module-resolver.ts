@@ -69,15 +69,11 @@ const selectImportsTarget = (map: PackageMap, request: string, conditions: Set<s
 };
 
 const emptyNativePackageRegistry = createNativePackageRegistry();
-const viteStartupSnapshotModule = 'dusk:virtual/vite-startup-snapshot';
 
 export const resolveModule = async (fs: FSBackend, request: string, fromDir: string, mode: ModuleMode, aliases = new Set<string>(), nativePackageRegistry: NativePackageRegistry = emptyNativePackageRegistry): Promise<ResolvedModule> => {
   if (fromDir.startsWith('file:')) {
     const url = new URL(fromDir);
     if (url.protocol === 'file:' && !url.hostname) fromDir = decodeURIComponent(url.pathname);
-  }
-  if (request === 'node:v8' && mode === 'import' && /\/node_modules\/vite\/dist\/node(?:\/|$)/.test(fromDir)) {
-    return { path: viteStartupSnapshotModule, format: 'esm' };
   }
   const nativeReplacement = nativePackageRegistry.resolve(request);
   if (nativeReplacement !== undefined) return { path: nativeReplacement, format: 'cjs' };

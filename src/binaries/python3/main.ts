@@ -43,24 +43,35 @@ type FsGlobal = {
 };
 const getFs = (): FsGlobal | undefined => (globalThis as Record<string, unknown>)['__fs'] as FsGlobal | undefined;
 
-const readStdinAll = (): string => {
+const stdinBytes = (value: unknown): Uint8Array | null => {
+  if (value instanceof Uint8Array) return value;
+  if (Array.isArray(value)) return Uint8Array.from(value as number[]);
+  return null;
+};
+
+const readStdinChunk = (wait: boolean): Uint8Array | null => {
   const ipc = (globalThis as { ipc?: Ipc }).ipc;
-  if (!ipc) return '';
-  let s = '';
-  for (let iter = 0; iter < 100000; iter++) {
-    const r = ipc.send({ f: 'proc.readStdin' });
-    const v = r.value;
-    if (v === null || v === undefined) break;
-    if (!Array.isArray(v)) break;
-    if (v.length === 0) {
-      // No more input immediately available. If we already have data or
-      // caller isn't piping, this is EOF.
-      if (s.length > 0) break;
-      break;
-    }
-    for (let i = 0; i < v.length; i++) s += String.fromCharCode(v[i]);
+  if (!ipc) return null;
+  try {
+    const r = ipc.send(wait ? { f: 'proc.readStdin', wait: true } : { f: 'proc.readStdin' }) as { value?: unknown; error?: string; signal?: string };
+    if (r.error || r.signal) return null;
+    return stdinBytes(r.value);
+  } catch { return null; }
+};
+
+const readStdinAll = (): string => {
+  const decoder = new TextDecoder();
+  let text = '';
+  while (true) {
+    const chunk = readStdinChunk(true);
+    if (chunk === null) break;
+    if (chunk.length > 0) text += decoder.decode(chunk, { stream: true });
   }
-  return s;
+  return text + decoder.decode();
+};
+
+const stdinIsTty = (): boolean => {
+  try { return call('tty.isatty', { fd: 0 }) === true; } catch { return false; }
 };
 
 // Simple line-buffered REPL: send each statement/block to python.exec.
@@ -73,17 +84,7 @@ const runRepl = async (): Promise<number> => {
   const ipc = (globalThis as { ipc?: Ipc }).ipc;
   if (!ipc) return 1;
 
-  const decode = (b: Uint8Array): string => { let s = ''; for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]!); return s; };
-  const readStdin = (): Uint8Array | null => {
-    try {
-      const r = ipc.send({ f: 'proc.readStdin' });
-      if (r.error) return null;
-      const v = r.value;
-      if (v === null || v === undefined) return null;
-      if (Array.isArray(v)) return new Uint8Array(v as number[]);
-      return null;
-    } catch { return null; }
-  };
+  const decoder = new TextDecoder();
   let lineBuf = '';
   const readLine = async (): Promise<string | null> => {
     while (true) {
@@ -93,13 +94,14 @@ const runRepl = async (): Promise<number> => {
         lineBuf = lineBuf.slice(nl + 1);
         return line;
       }
-      const chunk = readStdin();
+      const chunk = readStdinChunk(false);
       if (chunk === null) {
+        lineBuf += decoder.decode();
         if (lineBuf.length > 0) { const rest = lineBuf; lineBuf = ''; return rest; }
         return null;
       }
       if (chunk.length === 0) { await new Promise<void>((r) => setTimeout(r, 5)); continue; }
-      lineBuf += decode(chunk);
+      lineBuf += decoder.decode(chunk, { stream: true });
     }
   };
 
@@ -232,9 +234,8 @@ export const main = async (): Promise<number> => {
 
   // Interactive REPL when no script/-c/stdin flag.
   if (inlineCode === null && scriptPath === null && !readStdin) {
-    // Auto-detect piped stdin (non-TTY): drain and treat as script.
-    const piped = readStdinAll();
-    if (piped.trim().length > 0) {
+    if (!stdinIsTty()) {
+      const piped = readStdinAll();
       const argvForPy = ['python3', ...scriptArgs];
       const r = call('python.exec', { code: piped, argv: argvForPy }) as { stdout: string; stderr: string; exitCode: number };
       if (r.stdout) proc.stdout.write(r.stdout);

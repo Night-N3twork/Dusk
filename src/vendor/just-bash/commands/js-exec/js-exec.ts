@@ -121,9 +121,12 @@ const runCode = async (code: string, stdin: string, cwd: string, args: string[])
     // trusted so eval is permitted. (We're inside a WASI-isolated engine
     // already, so this doesn't defeat any real isolation.)
     const wrapped = "(async () => { " + code + "\n})();";
+    const lifecycle = g.__process?.__duskLifecycle;
+    const baseline = lifecycle && typeof lifecycle.active === "function" ? lifecycle.active() : 0;
     // eslint-disable-next-line no-eval
     const result = await DefenseInDepthBox.runTrustedAsync(async () => (0, eval)(wrapped));
     if (result && typeof result.then === "function") await result;
+    if (lifecycle && typeof lifecycle.whenAtMost === "function") await lifecycle.whenAtMost(baseline);
     return { stdout: stdoutBuf, stderr: stderrBuf, exitCode: 0 };
   } catch (e) {
     stderrBuf += (e && e.stack ? e.stack : String(e)) + "\n";
@@ -155,9 +158,9 @@ export const jsExecCommand: Command = {
     }
 
     let code = parsed.code;
-    const stdinText = typeof ctx.stdin === "string" ? ctx.stdin : "";
 
     if (parsed.fromStdin) {
+      const stdinText = typeof ctx.stdin === "string" ? ctx.stdin : "";
       // No -c, no file, no piped input — the user typed `node` or `js-exec`
       // expecting an interactive REPL. We don't have one inside dsh (dsh is
       // line-based, not stream-based). Print a hint instead of silently
@@ -189,7 +192,7 @@ export const jsExecCommand: Command = {
       return { stdout: "", stderr: "", exitCode: 0 };
     }
 
-    return await runCode(code, parsed.fromStdin ? "" : stdinText, ctx.cwd, parsed.args);
+    return await runCode(code, "", ctx.cwd, parsed.args);
   },
 };
 

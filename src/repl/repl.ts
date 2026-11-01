@@ -117,7 +117,7 @@ export const startRepl = (runner: ReplEngine, write: (text: string) => void): Du
       }
 
       const body = expression
-        ? 'globalThis.__replResult = (' + trimmed + '\n);'
+        ? 'globalThis.__replResult = (' + trimmed.replace(/;\s*$/, '') + '\n);'
         : persisted !== null
           ? persisted.rest === ''
             ? persisted.decl + '\nglobalThis.__replResult = undefined;'

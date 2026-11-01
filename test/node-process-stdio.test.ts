@@ -1,7 +1,7 @@
 import { test, expect } from 'vitest';
 import { bootRepl } from '../src/index';
 
-// Plan 8 T1 (narrowed): in the REPL (pid 0), process.stdout / process.stderr
+// In the REPL (pid 0), process.stdout / process.stderr
 // must be a real Writable backed by the host stream registry — not the
 // synchronous proc.write fallback. Concretely: it must expose the Writable
 // EventEmitter surface (`.on`, `.once`, etc.) AND writes must reach the

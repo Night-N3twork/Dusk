@@ -195,7 +195,7 @@ class ChildProcess {
     this.exit = new Promise<number>((resolve) => { this._exitResolve = resolve; });
     this.stdin = {
       write: (data: Uint8Array): boolean => {
-        call('process.stdinWrite', { pid, data: Array.from(data) });
+        call('process.stdinWrite', { pid, data });
         return true;
       },
       end: (): void => { call('process.stdinClose', { pid }); },

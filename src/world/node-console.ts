@@ -17,12 +17,12 @@ interface WriteTarget {
   write: (data: string) => unknown;
 }
 
-const writeTo = (target: WriteTarget | undefined, fallback: WriteTarget | undefined, text: string): void => {
+const writeTo = (target: WriteTarget | undefined, fallback: WriteTarget | undefined, text: string, ignoreErrors = true): void => {
   if (target) {
-    try { target.write(text); return; } catch { /* */ }
+    try { target.write(text); return; } catch (error) { if (!ignoreErrors) throw error; }
   }
   if (fallback) {
-    try { fallback.write(text); } catch { /* */ }
+    try { fallback.write(text); } catch (error) { if (!ignoreErrors) throw error; }
   }
 };
 
@@ -63,7 +63,7 @@ export class Console {
   }
 
   log(...args: unknown[]): void {
-    writeTo(this._stdout, this._stderr, this._indent() + this._fmt(args) + '\n');
+    writeTo(this._stdout, this._stderr, this._indent() + this._fmt(args) + '\n', this._ignoreErrors);
   }
 
   info(...args: unknown[]): void {
@@ -75,7 +75,7 @@ export class Console {
   }
 
   warn(...args: unknown[]): void {
-    writeTo(this._stderr, this._stdout, this._indent() + this._fmt(args) + '\n');
+    writeTo(this._stderr, this._stdout, this._indent() + this._fmt(args) + '\n', this._ignoreErrors);
   }
 
   error(...args: unknown[]): void {
@@ -195,7 +195,7 @@ export class Console {
 
   clear(): void {
     // best-effort: emit clear sequence
-    writeTo(this._stdout, this._stderr, '\x1b[2J\x1b[H');
+    writeTo(this._stdout, this._stderr, '\x1b[2J\x1b[H', this._ignoreErrors);
   }
 
   profile(_label?: string): void { /* no-op */ }

@@ -28,6 +28,12 @@ import { nodeRepl } from './node-repl';
 import { nodeCluster } from './node-cluster';
 import { nodeWorkerThreads } from './node-worker-threads';
 import { nodeModule } from './node-module';
+import { nodeDiagnosticsChannel } from './node-diagnostics-channel';
+import { nodeV8 } from './node-v8';
+import { nodeHttp2 } from './node-http2';
+import { nodeDgram } from './node-dgram';
+import { nodeSqlite } from './node-sqlite';
+import { nodeTest } from './node-test';
 import { errnoTable, signalTable, fsConstants, osConstants, priorityConstants, dlopenConstants } from './node-constants';
 import { createSystemLoader } from './system-loader';
 
@@ -68,6 +74,8 @@ export const installESM = (): void => {
     'string_decoder': builtinNs(nodeStringDecoder as unknown as Record<string, unknown>),
     'node:assert': builtinNs(nodeAssert as unknown as Record<string, unknown>),
     'assert': builtinNs(nodeAssert as unknown as Record<string, unknown>),
+    'node:assert/strict': builtinNs((nodeAssert as unknown as { strict: Record<string, unknown> }).strict),
+    'assert/strict': builtinNs((nodeAssert as unknown as { strict: Record<string, unknown> }).strict),
     'node:timers': builtinNs(nodeTimers as unknown as Record<string, unknown>),
     'timers': builtinNs(nodeTimers as unknown as Record<string, unknown>),
     'node:timers/promises': builtinNs(nodeTimersPromises as unknown as Record<string, unknown>),
@@ -108,6 +116,16 @@ export const installESM = (): void => {
     'worker_threads': builtinNs(nodeWorkerThreads as unknown as Record<string, unknown>),
     'node:module': builtinNs(nodeModule),
     'module': builtinNs(nodeModule),
+    'node:diagnostics_channel': builtinNs(nodeDiagnosticsChannel),
+    'diagnostics_channel': builtinNs(nodeDiagnosticsChannel),
+    'node:v8': builtinNs(nodeV8),
+    'v8': builtinNs(nodeV8),
+    'node:http2': builtinNs(nodeHttp2),
+    'http2': builtinNs(nodeHttp2),
+    'node:dgram': builtinNs(nodeDgram),
+    'dgram': builtinNs(nodeDgram),
+    'node:sqlite': builtinNs(nodeSqlite),
+    'node:test': builtinNs(nodeTest as unknown as Record<string, unknown>),
     'node:util/types': builtinNs(types),
     'util/types': builtinNs(types),
     'node:constants': builtinNs(nodeConstantsModule),

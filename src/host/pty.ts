@@ -32,8 +32,21 @@ export interface Pty {
   close(): void;
 }
 
+const latin1Bytes = (text: string): Uint8Array => {
+  const bytes = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+  return bytes;
+};
+
 class LineDiscipline {
   private buffer = '';
+
+  takePending(): Uint8Array | null {
+    if (this.buffer.length === 0) return null;
+    const pending = latin1Bytes(this.buffer);
+    this.buffer = '';
+    return pending;
+  }
 
   // Process input from master toward slave.
   // In cooked mode: handle ^C/^D, echo printable, buffer until \r/\n, emit line.
@@ -50,14 +63,16 @@ class LineDiscipline {
       if (code === 3) { onSignal('SIGINT'); continue; }       // ^C
       if (code === 4) {                                         // ^D
         if (this.buffer.length === 0) { onLine(new Uint8Array(0)); }
-        else { onLine(new TextEncoder().encode(this.buffer)); this.buffer = ''; }
+        else { onLine(latin1Bytes(this.buffer)); this.buffer = ''; }
         continue;
       }
       if (code === 28) { onSignal('SIGQUIT'); continue; }     // ^\
       if (code === 26) { onSignal('SIGTSTP'); continue; }     // ^Z
       if (code === 127 || code === 8) {                       // backspace / DEL
         if (this.buffer.length > 0) {
-          this.buffer = this.buffer.slice(0, -1);
+          let end = this.buffer.length - 1;
+          while (end > 0 && (this.buffer.charCodeAt(end) & 0xc0) === 0x80) end--;
+          this.buffer = this.buffer.slice(0, end);
           onEcho(new Uint8Array([8, 32, 8]));  // BS, space, BS
         }
         continue;
@@ -65,7 +80,7 @@ class LineDiscipline {
       if (code === 13 || code === 10) {                        // \r or \n
         this.buffer += '\n';
         onEcho(new Uint8Array([13, 10]));
-        onLine(new TextEncoder().encode(this.buffer));
+        onLine(latin1Bytes(this.buffer));
         this.buffer = '';
         continue;
       }
@@ -137,6 +152,10 @@ export const createPty = (pid: number, opts: PtyOptions = {}, hooks: PtyHooks = 
       onSigwinchHook(cols, rows);
     },
     setRawMode(raw) {
+      if (raw && !rawMode) {
+        const pending = discipline.takePending();
+        if (pending) onSlaveStdin(pending);
+      }
       rawMode = raw;
     },
     close() {

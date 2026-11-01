@@ -29,7 +29,7 @@ import { matchPattern } from "../conditionals.js";
 import { expandWord, getArrayElements } from "../expansion.js";
 import { callFunction } from "../functions.js";
 import { failure, result, success } from "../helpers/result.js";
-import type { InterpreterContext } from "../types.js";
+import { captureOutput, type InterpreterContext } from "../types.js";
 
 // List of shell keywords (matches bash)
 const SHELL_KEYWORDS = [
@@ -473,7 +473,7 @@ export async function handleCompgen(
 
       try {
         // Call the function - errors during execution return exit code 1
-        const funcResult = await callFunction(ctx, func, funcArgs, "");
+        const funcResult = await captureOutput(ctx, () => callFunction(ctx, func, funcArgs, ""));
 
         // Check if there was an error (e.g., division by zero)
         if (funcResult.exitCode !== 0) {
@@ -509,7 +509,7 @@ export async function handleCompgen(
     try {
       // Parse and execute the command
       const ast = parse(commandString);
-      const cmdResult = await ctx.executeScript(ast);
+      const cmdResult = await captureOutput(ctx, () => ctx.executeScript(ast));
 
       // Check for errors
       if (cmdResult.exitCode !== 0) {

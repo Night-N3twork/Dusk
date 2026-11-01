@@ -62,14 +62,13 @@ export class WriteStream extends Writable {
 
   override _write(chunk: unknown, _encoding: string, cb: (err?: Error | null) => void): void {
     try {
-      let bytes: number[];
+      let bytes: Uint8Array;
       if (typeof chunk === 'string') {
-        bytes = [];
-        for (let i = 0; i < chunk.length; i++) bytes.push(chunk.charCodeAt(i) & 0xff);
+        bytes = new TextEncoder().encode(chunk);
       } else if (chunk instanceof Uint8Array) {
-        bytes = Array.from(chunk);
+        bytes = chunk;
       } else {
-        bytes = [];
+        bytes = new Uint8Array(0);
       }
       __call('proc.write', { fd: this._fd, data: bytes });
       cb();

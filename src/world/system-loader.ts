@@ -7,7 +7,7 @@ interface SystemLoader {
   import(id: string, parentUrl?: string): Promise<Record<string, unknown>>;
   resolve(id: string, parentUrl?: string): string;
   instantiate(id: string, parentUrl?: string): unknown;
-  createContext(id: string): { url: string; resolve(id: string, parentUrl?: string): Promise<string> };
+  createContext(id: string): { url: string; filename?: string; dirname?: string; resolve(id: string, parentUrl?: string): string };
   getRegister(id?: string): unknown;
 }
 
@@ -26,7 +26,6 @@ const call = (f: string, extra: Record<string, unknown>): unknown => {
 };
 
 const dirOf = (path: string): string => path.split('/').slice(0, -1).join('/') || '/';
-const viteStartupSnapshotModule = 'dusk:virtual/vite-startup-snapshot';
 
 const fileUrlForVfsPath = (id: string): string =>
   id.startsWith('/')
@@ -63,17 +62,21 @@ export const createSystemLoader = (builtins: Record<string, Record<string, unkno
     formats.set(resolved.path, resolved.format);
     return resolved.path;
   };
-  loader.createContext = (id: string) => ({
-    url: fileUrlForVfsPath(id),
-    resolve: (request: string, parentUrl = id) => Promise.resolve(loader.resolve(request, parentUrl)),
-  });
+  loader.createContext = (id: string) => {
+    const path = vfsPathForResolution(id);
+    const local = path.startsWith('/');
+    return {
+      url: fileUrlForVfsPath(id),
+      ...(local ? { filename: path, dirname: dirOf(path) } : {}),
+      resolve: (request: string, parentUrl = id): string => {
+        const resolved = loader.resolve(request, parentUrl);
+        return builtins[resolved] ? (resolved.startsWith('node:') ? resolved : 'node:' + resolved) : fileUrlForVfsPath(resolved);
+      },
+    };
+  };
   loader.instantiate = (id: string): unknown => {
     const builtin = builtins[id];
     if (builtin) return registration(builtin, true);
-    if (id === viteStartupSnapshotModule) {
-      metadata.set(id, { exports: ['default'], imports: {}, stars: [] });
-      return registration({ default: { isBuildingSnapshot: (): boolean => false } }, true);
-    }
 
     const source = call('module.readSource', { path: id, mode: 'import' }) as string;
     if (id.endsWith('.json')) return registration(JSON.parse(source));

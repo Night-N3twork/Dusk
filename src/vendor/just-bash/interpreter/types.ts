@@ -16,6 +16,7 @@ import type {
   CommandRegistry,
   ExecResult,
   FeatureCoverageWriter,
+  TerminalAccess,
   TraceCallback,
 } from "../types.js";
 
@@ -404,6 +405,79 @@ export interface InterpreterState
   signal?: AbortSignal;
   /** Extra arguments injected via exec({ args }), appended to first command's args */
   extraArgs?: string[];
+  pauseGate?: () => Promise<void> | void;
+}
+
+export interface LiveOutputChunk {
+  stdout: string;
+  stderr: string;
+  stdoutKind?: "text" | "bytes";
+}
+
+export interface BackgroundJobRequest {
+  source: string;
+  cwd: string;
+  env: Record<string, string>;
+}
+
+export interface JobControl {
+  background(job: BackgroundJobRequest): number;
+  wait(args: string[]): Promise<number>;
+  builtin?(name: string, args: string[]): Promise<ExecResult> | undefined;
+}
+
+export async function captureOutput<T>(ctx: InterpreterContext, run: () => Promise<T>): Promise<T> {
+  ctx.captureDepth = (ctx.captureDepth ?? 0) + 1;
+  try {
+    return await run();
+  } finally {
+    ctx.captureDepth = (ctx.captureDepth ?? 1) - 1;
+  }
+}
+
+const LAZY_STDIN = Symbol("lazyGroupStdin");
+const lazyStdinStates = new WeakMap<object, { pending(): boolean; original(): string | undefined }>();
+
+export function installLazyGroupStdin(state: InterpreterState, load: () => string): void {
+  let pending = true;
+  let current: string | undefined;
+  let original: string | undefined;
+  Object.defineProperty(state, "groupStdin", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (pending) {
+        pending = false;
+        current = load();
+        original = current;
+      }
+      return current;
+    },
+    set(value: string | undefined) {
+      pending = false;
+      current = value;
+    },
+  });
+  lazyStdinStates.set(state, { pending: () => pending, original: () => original });
+}
+
+export function isGroupStdinPending(state: InterpreterState): boolean {
+  return lazyStdinStates.get(state)?.pending() === true;
+}
+
+export function saveGroupStdin(state: InterpreterState): unknown {
+  const lazy = lazyStdinStates.get(state);
+  if (lazy?.pending()) return LAZY_STDIN;
+  return state.groupStdin;
+}
+
+export function restoreGroupStdin(state: InterpreterState, saved: unknown): void {
+  if (saved !== LAZY_STDIN) {
+    state.groupStdin = saved as string | undefined;
+    return;
+  }
+  const lazy = lazyStdinStates.get(state);
+  if (lazy && !lazy.pending()) state.groupStdin = lazy.original();
 }
 
 export interface InterpreterContext {
@@ -433,6 +507,9 @@ export interface InterpreterContext {
   trace?: TraceCallback;
   /** Current command substitution nesting depth (for limit enforcement) */
   substitutionDepth?: number;
+  onOutput?: (chunk: LiveOutputChunk) => void;
+  captureDepth?: number;
+  jobControl?: JobControl;
   /** Optional feature coverage writer for fuzzing instrumentation */
   coverage?: FeatureCoverageWriter;
   /**
@@ -450,4 +527,6 @@ export interface InterpreterContext {
    * routes calls through this callback.
    */
   invokeTool?: (path: string, argsJson: string) => Promise<string>;
+  terminal?: TerminalAccess;
+  terminalDepth?: number;
 }

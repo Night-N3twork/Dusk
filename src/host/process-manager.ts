@@ -1,28 +1,24 @@
 import { createNativeEngine, type EngineFactory, type EngineInstance, type FuncTable, type SendFn } from './engine-instance';
 import type { FSBackend, FSMutation } from './fs-backend';
-import { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND } from './fs-backend';
 import { createFDTable, type FDTable } from './fd-table';
-import { norm, dirname } from './vfs';
-import { transformStaticImports } from './esm-static-transform';
-import { resolveModule as resolveSharedModule } from './module-resolver';
+import { norm } from './vfs';
 import { createNativePackageRegistry, type NativePackageRegistry, type NativePackageReplacementEntries, type NativePackageReplacementEntry } from './native-package-registry';
 import { esbuildWasmReplacementSource } from './esbuild-wasm';
 import { rollupBrowserReplacementSource, rollupParseAstReplacementSource } from './rollup-browser';
 import { SERIAL_RES_SIZE } from '../protocol/messages';
 import dshBinarySource from '../binaries/dsh/binary-entry.ts?worldsrc';
 import { loadDpmWasmCommand, type DpmHostCapabilities, type DpmHttpResponse, type DpmWasmCommand } from './dpm-wasm';
-  // /bin/node, /bin/sh.legacy, /bin/python3, and the dpm bundle
-// family are only needed when the user (or a script) explicitly invokes them.
-  // dsh has its own in-engine `js-exec` and `node` REPL, and dsh's python3
-// custom commands go through host IPC — none of that touches these bundles.
-// We load them lazily on first spawn to keep idle bundle+parsed-JS footprint
-// small. See the registerLazyBinary calls in the constructor.
 import { BUILTIN_BINARIES, JSH_COMMAND_SET } from './builtin-binaries';
 import { createSocketRegistry, type SocketRegistry, type SocketPair } from './socket-registry';
 import { createStreamRegistry, type StreamRegistry } from './stream-registry';
 import { createPtyManager, type PtyManager, type Pty } from './pty';
 import { createRelayTlsServer, type RelayListenAuthorizer, type TlsServerConnection } from './relay-tls-server';
 import type { TcpProvider, TcpStream } from './tcp';
+import { createDnsFuncs, type DnsResolver } from './dns';
+import { assertAllowed, type NetworkPolicy } from './network-policy';
+import { createCryptoFuncs } from './crypto-funcs';
+import { createFsFuncs } from './fs-funcs';
+import { formatHostError } from './host-errors';
 
 const SIGNAL_NUMBERS: Record<string, number> = {
   SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGBUS: 7, SIGFPE: 8,
@@ -31,6 +27,10 @@ const SIGNAL_NUMBERS: Record<string, number> = {
   SIGURG: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGIO: 29,
   SIGPWR: 30, SIGSYS: 31,
 };
+
+const textEncoder = new TextEncoder();
+
+const INTERRUPTING_SIGNALS = new Set(['SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGUSR1', 'SIGUSR2', 'SIGPIPE', 'SIGALRM', 'SIGTERM', 'SIGTSTP']);
 
 const DISPATCH_CHUNK_SIZE = Math.floor(SERIAL_RES_SIZE / 8);
 
@@ -149,7 +149,31 @@ export interface SshOptions {
   wasm: SshWasmSource;
 }
 
+export interface ProcessLimits {
+  maxProcesses?: number;
+  timeoutMs?: number;
+  maxOutputBytes?: number;
+}
+
+export interface ProcessManagerEventMap {
+  spawn: { pid: number; ppid: number; command: string; args: string[]; cwd: string };
+  exit: { pid: number; code: number; signal?: string };
+  stdout: { pid: number; chunk: Uint8Array };
+  stderr: { pid: number; chunk: Uint8Array };
+}
+
+export interface LoopbackConnection {
+  write(chunk: Uint8Array): void;
+  end(): void;
+  close(): void;
+  onData(listener: (chunk: Uint8Array) => void): () => void;
+  onEnd(listener: () => void): () => void;
+  onError(listener: (message: string) => void): () => void;
+}
+
 export interface ProcessManagerOptions {
+  limits?: ProcessLimits;
+  networkPolicy?: NetworkPolicy;
   relay?: RelayListener;
   relayTls?: {
     Connection: new (certificateChain: string | Uint8Array, privateKey: string | Uint8Array, options?: unknown) => TlsServerConnection;
@@ -165,6 +189,7 @@ export interface ProcessManagerOptions {
   nativePackageReplacements?: NativePackageReplacementEntries;
   /** Enables a host-supplied SSH bridge over the configured MoonBeam relay. */
   ssh?: SshOptions;
+  dns?: DnsResolver;
 }
 
 export type { DpmWasmCommand } from './dpm-wasm';
@@ -211,6 +236,7 @@ interface ProcessRecord {
   startTime: number;
   signalListeners: Set<string>;
   exitSignal?: string;
+  interruptStdinWait?: (signal: string) => void;
 }
 
 
@@ -221,16 +247,17 @@ interface DispatchHolder {
 
 interface InternalSpawnOptions extends SpawnOptions {
   _parentPid?: number;
+  _processGroup?: number;
   _onChildExit?: (emit: () => void) => void;
 }
 
-const formatErr = (e: unknown): string => (e instanceof Error ? (e.stack ?? e.message) : String(e));
+const formatErr = formatHostError;
 
 const normalizeStdin = (stdin: unknown): Uint8Array | undefined => {
   if (stdin === undefined || stdin === null) return undefined;
   if (stdin instanceof Uint8Array) return stdin;
   if (Array.isArray(stdin)) return Uint8Array.from(stdin as number[]);
-  if (typeof stdin === 'string') return new TextEncoder().encode(stdin);
+  if (typeof stdin === 'string') return textEncoder.encode(stdin);
   if (typeof stdin === 'object') {
     const vals = Object.values(stdin as Record<string, unknown>);
     if (vals.every((v) => typeof v === 'number')) return Uint8Array.from(vals as number[]);
@@ -264,6 +291,22 @@ export class ProcessManager {
   }
   private ptyManager: PtyManager = createPtyManager();
   private dispatchByPid = new Map<number, (js: string) => void>();
+  private stagerByPid = new Map<number, (bytes: Uint8Array) => string>();
+
+  private bytesExpr(pid: number, bytes: Uint8Array): string {
+    const stage = this.stagerByPid.get(pid);
+    return stage ? stage(bytes) : JSON.stringify(Array.from(bytes));
+  }
+
+  private trackEngine(pid: number, engine: EngineInstance): void {
+    this.dispatchByPid.set(pid, engine.dispatch);
+    if (engine.stageBytes) this.stagerByPid.set(pid, engine.stageBytes);
+  }
+
+  private untrackEngine(pid: number): void {
+    this.dispatchByPid.delete(pid);
+    this.stagerByPid.delete(pid);
+  }
   private fdTables = new Map<number, FDTable>();
   private fsWatchSubscriptions = new Map<number, Map<number, () => void>>();
   private nextFSWatchSubscription = 1;
@@ -325,6 +368,139 @@ export class ProcessManager {
   private dpmTransactions = new Map<string, Promise<void>>();
   private nextDpmTransactionId = 0;
   private readonly nativePackageRegistry: NativePackageRegistry;
+  private readonly dnsFuncs: FuncTable;
+  private readonly limits: ProcessLimits;
+  private readonly networkPolicy: NetworkPolicy | undefined;
+  private pendingSpawns = 0;
+  private disposed = false;
+  private eventListeners = new Map<keyof ProcessManagerEventMap, Set<(payload: never) => void>>();
+
+  on<K extends keyof ProcessManagerEventMap>(event: K, listener: (payload: ProcessManagerEventMap[K]) => void): () => void {
+    let set = this.eventListeners.get(event);
+    if (!set) {
+      set = new Set();
+      this.eventListeners.set(event, set);
+    }
+    set.add(listener as (payload: never) => void);
+    return () => this.off(event, listener);
+  }
+
+  off<K extends keyof ProcessManagerEventMap>(event: K, listener: (payload: ProcessManagerEventMap[K]) => void): void {
+    this.eventListeners.get(event)?.delete(listener as (payload: never) => void);
+  }
+
+  private emitEvent<K extends keyof ProcessManagerEventMap>(event: K, payload: ProcessManagerEventMap[K]): void {
+    const set = this.eventListeners.get(event);
+    if (!set) return;
+    for (const listener of [...set]) {
+      try {
+        (listener as (payload: ProcessManagerEventMap[K]) => void)(payload);
+      } catch (error) {
+        queueMicrotask(() => { throw error; });
+      }
+    }
+  }
+
+  private assertCanSpawn(): void {
+    if (this.disposed) throw new Error('ProcessManager has been disposed');
+    const max = this.limits.maxProcesses;
+    if (max === undefined) return;
+    let active = this.pendingSpawns;
+    for (const pid of this.processes.keys()) if (pid !== 0) active++;
+    if (active >= max) {
+      const error = new Error(`EAGAIN: process limit reached (${max})`);
+      (error as Error & { code?: string }).code = 'EAGAIN';
+      throw error;
+    }
+  }
+
+  private watchProcess(pid: number, cmd: string, args: string[], options: SpawnOptions, handle: DuskProcessHandle): void {
+    const record = this.processes.get(pid);
+    this.emitEvent('spawn', { pid, ppid: record?.ppid ?? 0, command: cmd, args: [...args], cwd: options.cwd ?? '/' });
+    const timeoutMs = this.limits.timeoutMs;
+    if (timeoutMs === undefined) return;
+    const timer = setTimeout(() => {
+      const rec = this.processes.get(pid);
+      if (rec) rec.exitSignal = 'SIGKILL';
+      handle.kill();
+    }, timeoutMs);
+    void handle.exit.finally(() => clearTimeout(timer));
+  }
+
+  connectLoopback(port: number, host = 'localhost'): LoopbackConnection {
+    const server = this.socketRegistry.findServer(host, port);
+    if (!server) {
+      const error = new Error(`ECONNREFUSED: connect ECONNREFUSED ${host}:${port}`);
+      (error as Error & { code?: string }).code = 'ECONNREFUSED';
+      throw error;
+    }
+    const reg = this.socketRegistry;
+    const clientSocketId = reg.allocateSocketId();
+    const serverSocketId = reg.allocateSocketId();
+    const dataListeners = new Set<(chunk: Uint8Array) => void>();
+    const endListeners = new Set<() => void>();
+    const errorListeners = new Set<(message: string) => void>();
+    let closed = false;
+    const dispatchServer = (js: string): void => { this.dispatchByPid.get(server.enginePid)?.(js); };
+    const toServer: SocketPair = {
+      pushToClient: (chunk) => dispatchServer(`if (globalThis.__net) globalThis.__net.dispatch('data', ${serverSocketId}, ${this.bytesExpr(server.enginePid, chunk)});`),
+      closeClient: () => dispatchServer(`if (globalThis.__net) globalThis.__net.dispatch('end', ${serverSocketId});`),
+      errorClient: (message) => dispatchServer(`if (globalThis.__net) globalThis.__net.dispatch('error', ${serverSocketId}, ${JSON.stringify(message)});`),
+    };
+    const toHost: SocketPair = {
+      pushToClient: (chunk) => { for (const listener of dataListeners) listener(chunk.slice()); },
+      closeClient: () => { for (const listener of endListeners) listener(); },
+      errorClient: (message) => { for (const listener of errorListeners) listener(message); },
+    };
+    reg.setPair(clientSocketId, toServer);
+    reg.setPair(serverSocketId, toHost);
+    server.onConnection(serverSocketId);
+    const subscribe = <T>(set: Set<T>, listener: T): (() => void) => {
+      set.add(listener);
+      return () => set.delete(listener);
+    };
+    return {
+      write: (chunk) => { if (!closed) toServer.pushToClient(chunk); },
+      end: () => { if (!closed) toServer.closeClient(); },
+      close: () => {
+        if (closed) return;
+        closed = true;
+        toServer.closeClient();
+        reg.removePair(clientSocketId);
+        reg.removePair(serverSocketId);
+        dataListeners.clear();
+        endListeners.clear();
+        errorListeners.clear();
+      },
+      onData: (listener) => subscribe(dataListeners, listener),
+      onEnd: (listener) => subscribe(endListeners, listener),
+      onError: (listener) => subscribe(errorListeners, listener),
+    };
+  }
+
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    const exits: Promise<unknown>[] = [];
+    for (const record of this.processes.values()) {
+      if (record.pid === 0) continue;
+      exits.push(record.handle.exit.catch(() => undefined));
+      try { record.handle.kill(); } catch { }
+    }
+    await Promise.race([Promise.all(exits), new Promise((resolve) => setTimeout(resolve, 2000))]);
+    const zero = this.processes.get(0);
+    if (zero?.engine) await zero.engine.terminate().catch(() => 0);
+    this.close();
+    for (const pid of [...this.fsWatchSubscriptions.keys()]) this.clearFSWatchSubscriptions(pid);
+    for (const [pid, table] of this.fdTables) {
+      table.closeAll((entry) => { void this.fs.closeHandle(entry.backendHandle, { pid }).catch(() => {}); });
+    }
+    this.fdTables.clear();
+    this.processes.clear();
+    this.dispatchByPid.clear();
+    this.stagerByPid.clear();
+    this.eventListeners.clear();
+  }
 
   constructor(
     fs: FSBackend,
@@ -342,6 +518,12 @@ export class ProcessManager {
     this.dpmWasm = options.dpmWasm;
     this.dpmFetch = options.dpmFetch;
     this.dpmFetchBytes = options.dpmFetchBytes;
+    this.limits = options.limits ?? {};
+    this.networkPolicy = options.networkPolicy;
+    this.dnsFuncs = createDnsFuncs({
+      ...(options.dns ? { resolver: options.dns } : {}),
+      isLocalHost: (hostname) => this.socketRegistry.hasHost(hostname),
+    });
     const defaultNativePackageReplacements: readonly NativePackageReplacementEntry[] = [
       ['esbuild', esbuildWasmReplacementSource],
       ['rollup', rollupBrowserReplacementSource, { packageVersion: '4.20.0', packagePathSuffix: '/node_modules/vite/node_modules/rollup', packageEntryPath: 'dist/rollup.js' }],
@@ -372,11 +554,10 @@ export class ProcessManager {
     // has its own in-engine node REPL and doesn't rely on this.
     this.registerLazyBinary('/bin/node', async () =>
       (await import('../binaries/node/binary-entry.ts?worldsrc')).default);
-    // /bin/sh.legacy — retained "in case anything explicitly needs it".
-    // Nothing in-tree does; loading it costs a Vite dynamic import if
-    // someone actually calls it. Remove entirely once dsh proves stable.
-    this.registerLazyBinary('/bin/sh.legacy', async () =>
-      (await import('../shell/binary-entry.ts?worldsrc')).default);
+    this.registerLazyBinary('/bin/tsx', async () =>
+      (await import('../binaries/tsx/binary-entry.ts?worldsrc')).default);
+    this.registerLazyBinary('/bin/git', async () =>
+      (await import('../binaries/git/binary-entry.ts?worldsrc')).default);
     // Lazy: python3, python alias, dpm/dpx/npm/npx/pnpm.
     // These get their source fetched from a code-split chunk on first spawn.
     const loadPython = async (): Promise<string> =>
@@ -697,10 +878,7 @@ export class ProcessManager {
       // Best-effort: we don't actually pause the worker (would require a host primitive)
       return;
     }
-    if (signame === 'SIGCONT') {
-      return;
-    }
-    // Other signals: dispatch envelope into the engine so process.on(signame) fires
+    if (INTERRUPTING_SIGNALS.has(signame)) rec.interruptStdinWait?.(signame);
     const dispatch = this.dispatchByPid.get(rec.pid);
     if (!dispatch) return;
     const signo = SIGNAL_NUMBERS[signame] ?? 0;
@@ -741,6 +919,8 @@ export class ProcessManager {
     const hostname = opts?.hostname ?? 'duskjs';
     const dispatchHolder: DispatchHolder = { dispatch: null };
     const spawnFuncs = this.buildSpawnFuncs(dispatchHolder);
+    const sinkDecoder = new TextDecoder();
+    const writeDecoder = new TextDecoder();
     const consoleFuncs: FuncTable = {
       'console.log': (msg, send) => {
         const text = ((msg['args'] as unknown[]) ?? []).map(String).join(' ') + '\n';
@@ -752,7 +932,7 @@ export class ProcessManager {
         write(text);
         send({});
       },
-      // Plan 8 T1 (narrowed to pid 0 / REPL only): the world side asks the
+      // pid 0 only: the world side asks the
       // host to pump a stream id's chunks to the REPL print sink. This gives
       // process.stdout / process.stderr a real Writable surface (backpressure,
       // event emitter methods) while keeping the mirror-to-write() semantics
@@ -766,7 +946,7 @@ export class ProcessManager {
           producerPid: 0,
           consumerPid: 0,
           onChunk: (chunk) => {
-            write(new TextDecoder().decode(chunk));
+            write(sinkDecoder.decode(chunk, { stream: true }));
             // The REPL print sink drains synchronously — refund the credit
             // immediately and notify the engine producer so it can keep
             // flowing without blocking on the 64KB window.
@@ -782,8 +962,8 @@ export class ProcessManager {
     };
     const writeFunc: FuncTable = {
       'proc.write': (m, send) => {
-        const data = m['data'] as number[] | undefined;
-        if (data) write(new TextDecoder().decode(new Uint8Array(data)));
+        const data = m['data'] as Uint8Array | number[] | undefined;
+        if (data) write(writeDecoder.decode(data instanceof Uint8Array ? data : new Uint8Array(data), { stream: true }));
         send({});
       },
     };
@@ -796,7 +976,7 @@ export class ProcessManager {
       return terminate();
     };
     dispatchHolder.dispatch = engine.dispatch;
-    this.dispatchByPid.set(0, engine.dispatch);
+    this.trackEngine(0, engine);
 
     // Register pid-0 record so process.bootstrap, env.set, etc. work in the REPL engine
     const home = `/home/${user}`;
@@ -830,12 +1010,34 @@ export class ProcessManager {
   }
 
   async spawn(cmd: string, args: string[] = [], options: SpawnOptions = {}): Promise<DuskProcessHandle> {
+    this.assertCanSpawn();
+    this.pendingSpawns++;
+    try {
+      return await this.spawnProcess(cmd, args, options);
+    } finally {
+      this.pendingSpawns--;
+    }
+  }
+
+  private async spawnProcess(cmd: string, args: string[], options: SpawnOptions): Promise<DuskProcessHandle> {
     ({ cmd, args } = this.resolveAlias(cmd, args));
     // Fold JSH-wrapper spawns into a direct dsh -c invocation before we
     // allocate a pid or a worker. See maybeElideJshWrapper for rationale.
     ({ cmd, args } = this.maybeElideJshWrapper(cmd, args));
     const pid = this.nextPid++;
     const stdinBytes = normalizeStdin(options.stdin);
+    let outputBytes = 0;
+    let onOutputLimit: (() => void) | undefined;
+    const observeOutput = (stream: 'stdout' | 'stderr', chunk: Uint8Array): boolean => {
+      outputBytes += chunk.byteLength;
+      const limit = this.limits.maxOutputBytes;
+      if (limit !== undefined && outputBytes > limit) {
+        onOutputLimit?.();
+        return false;
+      }
+      this.emitEvent(stream, { pid, chunk });
+      return true;
+    };
 
     let stdoutController: ReadableStreamDefaultController<Uint8Array> | null = null;
     let stdoutClosed = false;
@@ -865,6 +1067,7 @@ export class ProcessManager {
       pull() { drainStdoutHostWrites(); },
     });
     const enqueueStdout = (chunk: Uint8Array): void => {
+      if (!observeOutput('stdout', chunk)) return;
       if (stdoutController) { try { stdoutController.enqueue(chunk); } catch { /* closed */ } }
       else stdoutBacklog.push(chunk);
     };
@@ -874,7 +1077,7 @@ export class ProcessManager {
       if (stdoutController) { try { stdoutController.close(); } catch { /* */ } }
     };
     const writeStdout = (chunk: Uint8Array): Promise<void> => new Promise((resolve) => {
-      if (stdoutClosed) { resolve(); return; }
+      if (stdoutClosed || !observeOutput('stdout', chunk)) { resolve(); return; }
       stdoutHostWrites.push({ chunk, resolve });
       drainStdoutHostWrites();
     });
@@ -907,6 +1110,7 @@ export class ProcessManager {
       pull() { drainStderrHostWrites(); },
     });
     const enqueueStderr = (chunk: Uint8Array): void => {
+      if (!observeOutput('stderr', chunk)) return;
       if (stderrController) { try { stderrController.enqueue(chunk); } catch { /* closed */ } }
       else stderrBacklog.push(chunk);
     };
@@ -916,7 +1120,7 @@ export class ProcessManager {
       if (stderrController) { try { stderrController.close(); } catch { /* */ } }
     };
     const writeStderr = (chunk: Uint8Array): Promise<void> => new Promise((resolve) => {
-      if (stderrClosed) { resolve(); return; }
+      if (stderrClosed || !observeOutput('stderr', chunk)) { resolve(); return; }
       stderrHostWrites.push({ chunk, resolve });
       drainStderrHostWrites();
     });
@@ -947,7 +1151,6 @@ export class ProcessManager {
       drainStdinWrites();
 
       let process: StreamingHostProcess | undefined;
-      let killed = false;
       let settled = false;
       let resolveExit!: (status: number) => void;
       const exit = new Promise<number>((resolve) => { resolveExit = resolve; });
@@ -977,6 +1180,7 @@ export class ProcessManager {
           const record = this.processes.get(pid);
           if (record) this._emitChildExit(record, status);
           this.processes.delete(pid);
+          this.emitEvent('exit', { pid, code: status, ...(record?.exitSignal ? { signal: record.exitSignal } : {}) });
           resolveExit(status);
         })();
       };
@@ -997,7 +1201,6 @@ export class ProcessManager {
         stderr,
         kill: () => {
           if (settled) return;
-          killed = true;
           try { process?.kill(); } catch { /* best-effort termination */ }
           finish(137, true);
         },
@@ -1006,11 +1209,17 @@ export class ProcessManager {
       const explicitParent = (options as InternalSpawnOptions)._parentPid;
       const parentPid = explicitParent !== undefined ? explicitParent : (this.processes.get(0)?.pid ?? 0);
       this.processes.set(pid, {
-        pid, ppid: parentPid, pgid: pid, sid: pid, handle,
+        pid, ppid: parentPid, pgid: (options as InternalSpawnOptions)._processGroup ?? pid, sid: pid, handle,
         stdinBuffer: [], stdinClosed: false,
         argv: [cmd, ...args], argv0: cmd, execPath: cmd,
         env, cwd: options.cwd ?? '/', title: cmd, startTime: Date.now(), signalListeners: new Set(),
       });
+      onOutputLimit = () => {
+        const record = this.processes.get(pid);
+        if (record) record.exitSignal = 'SIGXFSZ';
+        handle.kill();
+      };
+      this.watchProcess(pid, cmd, args, options, handle);
       void Promise.resolve().then(() => streamingHostBinary({
         args,
         cwd: options.cwd ?? '/',
@@ -1034,8 +1243,19 @@ export class ProcessManager {
     const stdinBuffer: Uint8Array[] = [];
     let stdinClosed = false;
     if (stdinBytes) stdinBuffer.push(stdinBytes);
+    const stdinWaiters: Array<(signal?: string) => void> = [];
+    const wakeStdinReaders = (signal?: string): void => {
+      for (const wake of stdinWaiters.splice(0)) wake(signal);
+    };
+    const pushStdin = (chunk: Uint8Array): void => {
+      stdinBuffer.push(chunk);
+      wakeStdinReaders();
+    };
+    const closeStdinBuffer = (): void => {
+      stdinClosed = true;
+      wakeStdinReaders();
+    };
 
-    let recordRef: ProcessRecord | null = null;
     let masterPty: Pty | undefined;
     if (options.pty) {
       const ptyOpts = typeof options.pty === 'object' ? options.pty : {};
@@ -1045,9 +1265,9 @@ export class ProcessManager {
         // `proc.readStdin` reads from.
         onSlaveStdin: (chunk) => {
           if (stdinClosed) return;
-          stdinBuffer.push(chunk);
+          pushStdin(chunk);
         },
-        onSignal: (sig) => { this._deliverSignal(pid, sig); },
+        onSignal: (sig) => { this._deliverSignal(-(this.processes.get(pid)?.pgid ?? pid), sig); },
         onSigwinch: (cols, rows) => { this._deliverSignalWithPayload(pid, 'SIGWINCH', { cols, rows }); },
       });
       // Note on echo: the discipline emits typed characters back through the
@@ -1067,27 +1287,26 @@ export class ProcessManager {
             masterPty.masterWrite(chunk);
           },
           close: async () => {
-            stdinClosed = true;
-            // Also signal EOF to the discipline so it flushes any partial line.
-            if (masterPty) masterPty.masterWrite(new Uint8Array([4])); // ^D
+            if (masterPty) masterPty.masterWrite(new Uint8Array([4]));
+            closeStdinBuffer();
           },
         }
       : {
-          write: async (chunk) => { if (!stdinClosed) stdinBuffer.push(chunk); },
-          close: async () => { stdinClosed = true; },
+          write: async (chunk) => { if (!stdinClosed) pushStdin(chunk); },
+          close: async () => { closeStdinBuffer(); },
         };
 
     const ioFuncs: FuncTable = {
       'console.log': (msg, send) => {
         const text = ((msg['args'] as unknown[]) ?? []).map(String).join(' ') + '\n';
-        const bytes = new TextEncoder().encode(text);
+        const bytes = textEncoder.encode(text);
         if (masterPty) masterPty.slaveWrite(bytes);
         enqueueStdout(bytes);
         send({});
       },
       'console.error': (msg, send) => {
         const text = ((msg['args'] as unknown[]) ?? []).map(String).join(' ') + '\n';
-        const bytes = new TextEncoder().encode(text);
+        const bytes = textEncoder.encode(text);
         if (masterPty) masterPty.slaveWrite(bytes);
         enqueueStderr(bytes);
         send({});
@@ -1103,11 +1322,16 @@ export class ProcessManager {
         }
         send({});
       },
-      'proc.readStdin': (_m, send) => {
-        const chunk = stdinBuffer.shift();
-        if (chunk) send({ value: Array.from(chunk) });
-        else if (stdinClosed) send({ value: null });
-        else send({ value: [] });
+      'proc.readStdin': (m, send) => {
+        const reply = (signal?: string): void => {
+          if (signal) { send({ value: [], signal }); return; }
+          const chunk = stdinBuffer.shift();
+          if (chunk) send({ value: chunk });
+          else if (stdinClosed) send({ value: null });
+          else send({ value: [] });
+        };
+        if (m['wait'] === true && stdinBuffer.length === 0 && !stdinClosed) stdinWaiters.push(reply);
+        else reply();
       },
     };
 
@@ -1122,7 +1346,7 @@ export class ProcessManager {
 
     const engine = await this.engineFactory(pid, funcs);
     dispatchHolder.dispatch = engine.dispatch;
-    this.dispatchByPid.set(pid, engine.dispatch);
+    this.trackEngine(pid, engine);
     const entryJs = await this.buildEntry(cmd, args, options.env ?? {}, options.cwd ?? '/');
 
     const exitPromise = (async (): Promise<number> => {
@@ -1130,7 +1354,7 @@ export class ProcessManager {
       const code = await engine.exited;
       this.cleanupNetworkForPid(pid);
       this.clearFSWatchSubscriptions(pid);
-      this.dispatchByPid.delete(pid);
+      this.untrackEngine(pid);
       // engine.exited resolves after the worker has processed all queued messages,
       // so any proc.write from the world before process.exit has already enqueued
       // into the streams via ioFuncs above.
@@ -1145,6 +1369,7 @@ export class ProcessManager {
         this.fdTables.delete(pid);
       }
       this.processes.delete(pid);
+      this.emitEvent('exit', { pid, code, ...(rec?.exitSignal ? { signal: rec.exitSignal } : {}) });
       return code;
     })();
 
@@ -1162,7 +1387,7 @@ export class ProcessManager {
     const explicitParent = (options as InternalSpawnOptions)._parentPid;
     const parentPid = explicitParent !== undefined ? explicitParent : (this.processes.get(0)?.pid ?? 0);
     const record: ProcessRecord = {
-      pid, ppid: parentPid, pgid: pid, sid: pid, engine, handle, stdinBuffer, stdinClosed: false,
+      pid, ppid: parentPid, pgid: (options as InternalSpawnOptions)._processGroup ?? pid, sid: pid, engine, handle, stdinBuffer, stdinClosed: false,
       argv: [cmd, ...args],
       argv0: cmd,
       execPath: cmd,
@@ -1171,14 +1396,29 @@ export class ProcessManager {
       title: cmd,
       startTime: Date.now(),
       signalListeners: new Set(),
+      interruptStdinWait: (signal) => wakeStdinReaders(signal),
     };
     this.processes.set(pid, record);
-    recordRef = record;
+    onOutputLimit = () => {
+      record.exitSignal = 'SIGXFSZ';
+      handle.kill();
+    };
+    this.watchProcess(pid, cmd, args, options, handle);
 
     return handle;
   }
 
   async spawnSync(cmd: string, args: string[] = [], options: SpawnOptions = {}): Promise<SpawnSyncResult> {
+    this.assertCanSpawn();
+    this.pendingSpawns++;
+    try {
+      return await this.spawnSyncProcess(cmd, args, options);
+    } finally {
+      this.pendingSpawns--;
+    }
+  }
+
+  private async spawnSyncProcess(cmd: string, args: string[], options: SpawnOptions): Promise<SpawnSyncResult> {
     ({ cmd, args } = this.resolveAlias(cmd, args));
     ({ cmd, args } = this.maybeElideJshWrapper(cmd, args));
     const hostBinary = this.hostBinaries.get(cmd);
@@ -1192,7 +1432,7 @@ export class ProcessManager {
       if (stdin) context.stdin = stdin;
       const result = await hostBinary(context);
       const toBytes = (data: string | Uint8Array | undefined): Uint8Array =>
-        data instanceof Uint8Array ? data : new TextEncoder().encode(data ?? '');
+        data instanceof Uint8Array ? data : textEncoder.encode(data ?? '');
       return {
         status: result.status ?? 0,
         stdout: toBytes(result.stdout),
@@ -1206,31 +1446,39 @@ export class ProcessManager {
     const stdinClosed = true;
     const stdinBytes = normalizeStdin(options.stdin);
     if (stdinBytes) stdinBuffer.push(stdinBytes);
+    let outputBytes = 0;
+    let onOutputLimit: (() => void) | undefined;
+    const pushOutput = (stream: 'stdout' | 'stderr', bytes: Uint8Array): void => {
+      outputBytes += bytes.byteLength;
+      const limit = this.limits.maxOutputBytes;
+      if (limit !== undefined && outputBytes > limit) {
+        onOutputLimit?.();
+        return;
+      }
+      (stream === 'stderr' ? stderrChunks : stdoutChunks).push(bytes);
+      this.emitEvent(stream, { pid, chunk: bytes });
+    };
 
     const ioFuncs: FuncTable = {
       'console.log': (msg, send) => {
         const text = ((msg['args'] as unknown[]) ?? []).map(String).join(' ') + '\n';
-        stdoutChunks.push(new TextEncoder().encode(text));
+        pushOutput('stdout', textEncoder.encode(text));
         send({});
       },
       'console.error': (msg, send) => {
         const text = ((msg['args'] as unknown[]) ?? []).map(String).join(' ') + '\n';
-        stderrChunks.push(new TextEncoder().encode(text));
+        pushOutput('stderr', textEncoder.encode(text));
         send({});
       },
       'proc.write': (m, send) => {
         const data = m['data'] as number[] | undefined;
         const fd = (m['fd'] as number | undefined) ?? 1;
-        if (data) {
-          const bytes = new Uint8Array(data);
-          if (fd === 2) stderrChunks.push(bytes);
-          else stdoutChunks.push(bytes);
-        }
+        if (data) pushOutput(fd === 2 ? 'stderr' : 'stdout', new Uint8Array(data));
         send({});
       },
       'proc.readStdin': (_m, send) => {
         const chunk = stdinBuffer.shift();
-        if (chunk) send({ value: Array.from(chunk) });
+        if (chunk) send({ value: chunk });
         else if (stdinClosed) send({ value: null });
         else send({ value: [] });
       },
@@ -1247,7 +1495,7 @@ export class ProcessManager {
 
     const engine = await this.engineFactory(pid, funcs);
     dispatchHolder.dispatch = engine.dispatch;
-    this.dispatchByPid.set(pid, engine.dispatch);
+    this.trackEngine(pid, engine);
     const entryJs = await this.buildEntry(cmd, args, options.env ?? {}, options.cwd ?? '/');
 
     // register a minimal ProcessRecord for spawnSync so process.bootstrap works
@@ -1265,11 +1513,16 @@ export class ProcessManager {
       ? requestedParentPid
       : 0;
     const syncRec: ProcessRecord = {
-      pid, ppid: parentPid, pgid: pid, sid: pid, engine, handle: syncHandle, stdinBuffer: [], stdinClosed: true,
+      pid, ppid: parentPid, pgid: (options as InternalSpawnOptions)._processGroup ?? pid, sid: pid, engine, handle: syncHandle, stdinBuffer: [], stdinClosed: true,
       argv: [cmd, ...args], argv0: cmd, execPath: cmd,
       env, cwd: options.cwd ?? '/', title: cmd, startTime: Date.now(), signalListeners: new Set(),
     };
     this.processes.set(pid, syncRec);
+    onOutputLimit = () => {
+      syncRec.exitSignal = 'SIGXFSZ';
+      syncHandle.kill();
+    };
+    this.watchProcess(pid, cmd, args, options, syncHandle);
 
     void engine.run(entryJs);
     const status = await engine.exited;
@@ -1285,7 +1538,8 @@ export class ProcessManager {
       this.fdTables.delete(pid);
     }
     this.processes.delete(pid);
-    this.dispatchByPid.delete(pid);
+    this.untrackEngine(pid);
+    this.emitEvent('exit', { pid, code: status, ...(syncRec.exitSignal ? { signal: syncRec.exitSignal } : {}) });
 
     const concat = (parts: Uint8Array[]): Uint8Array => {
       const total = parts.reduce((a, c) => a + c.length, 0);
@@ -1322,9 +1576,8 @@ export class ProcessManager {
           producerPid: child.pid,
           consumerPid: 0, // parent
           onChunk: (chunk) => {
-            const arr = Array.from(chunk);
             dispatch(
-              `if (globalThis.__process && globalThis.__process.dispatch) globalThis.__process.dispatch(${child.pid}, ${JSON.stringify(kind)}, ${JSON.stringify(arr)});`,
+              `if (globalThis.__process && globalThis.__process.dispatch) globalThis.__process.dispatch(${child.pid}, ${JSON.stringify(kind)}, ${this.bytesExpr(callerPid ?? 0, chunk)});`,
             );
           },
           onEnd: () => {
@@ -1383,8 +1636,12 @@ export class ProcessManager {
       'process.spawn': (m, send) => {
         void (async () => {
           try {
-            const opts = (m['options'] as SpawnOptions) ?? {};
-            if (callerPid !== undefined) (opts as SpawnOptions & { _parentPid?: number })._parentPid = callerPid;
+            const opts = (m['options'] as InternalSpawnOptions) ?? {};
+            if (callerPid !== undefined) {
+              opts._parentPid = callerPid;
+              const group = this.processes.get(callerPid)?.pgid;
+              if (group !== undefined) opts._processGroup = group;
+            }
             const proc = await this.spawn(
               m['command'] as string,
               (m['args'] as string[]) ?? [],
@@ -1401,6 +1658,8 @@ export class ProcessManager {
         void (async () => {
           try {
             const opts = ((m['options'] as SpawnOptions) ?? {}) as InternalSpawnOptions;
+            const group = callerPid !== undefined ? this.processes.get(callerPid)?.pgid : undefined;
+            if (group !== undefined) opts._processGroup = group;
             const notifyParent = callerPid !== undefined && this.processes.get(callerPid)?.signalListeners.has('SIGCHLD');
             if (notifyParent) opts._parentPid = callerPid;
             let emitChildExit: (() => void) | undefined;
@@ -1410,7 +1669,7 @@ export class ProcessManager {
               (m['args'] as string[]) ?? [],
               opts,
             );
-            send({ value: { stdout: Array.from(r.stdout), stderr: Array.from(r.stderr), status: r.status } });
+            send({ value: { stdout: r.stdout, stderr: r.stderr, status: r.status } });
             // Let the SAB caller consume its result before a child-exit
             // dispatch can start a secondary evaluation in that same engine.
             if (emitChildExit) setTimeout(emitChildExit, 0);
@@ -1424,11 +1683,11 @@ export class ProcessManager {
           return;
         }
         const data = m['data'];
-        if (!Array.isArray(data)) {
+        if (!(data instanceof Uint8Array) && !Array.isArray(data)) {
           send({ error: 'EINVAL: stdin data must be a byte array' });
           return;
         }
-        void child.handle.stdin.write(Uint8Array.from(data as number[])).then(() => send({ value: true }), (error) => send({ error: formatErr(error) }));
+        void child.handle.stdin.write(data instanceof Uint8Array ? data : Uint8Array.from(data as number[])).then(() => send({ value: true }), (error) => send({ error: formatErr(error) }));
       },
       'process.stdinClose': (m, send) => {
         const child = this.processes.get(m['pid'] as number);
@@ -1564,287 +1823,7 @@ export class ProcessManager {
       },
     };
 
-    const subtleAvailable = typeof crypto !== 'undefined' && typeof crypto.subtle !== 'undefined' && typeof crypto.subtle.digest === 'function';
-
-    const cryptoFuncs: FuncTable = {
-      'crypto.random': (m, send) => {
-        const size = (m['size'] as number) | 0;
-        const buf = new Uint8Array(size);
-        if (typeof crypto !== 'undefined' && crypto.getRandomValues) crypto.getRandomValues(buf);
-        else for (let i = 0; i < size; i++) buf[i] = Math.floor(Math.random() * 256);
-        ok(send, Array.from(buf));
-      },
-      'crypto.digest': (m, send) => {
-        if (!subtleAvailable) { err(send, new Error('SubtleCrypto unavailable')); return; }
-        void (async () => {
-          try {
-            const algorithm = (m['algorithm'] as string).toUpperCase();
-            const data = m['data'] as number[];
-            const buf = await crypto.subtle.digest(algorithm, Uint8Array.from(data));
-            ok(send, Array.from(new Uint8Array(buf)));
-          } catch (e) { err(send, e); }
-        })();
-      },
-      'crypto.hmac': (m, send) => {
-        if (!subtleAvailable) { err(send, new Error('SubtleCrypto unavailable')); return; }
-        void (async () => {
-          try {
-            const algorithm = (m['algorithm'] as string).toUpperCase();
-            const keyArr = Uint8Array.from(m['key'] as number[]);
-            const data = Uint8Array.from(m['data'] as number[]);
-            const key = await crypto.subtle.importKey('raw', keyArr, { name: 'HMAC', hash: algorithm }, false, ['sign']);
-            const buf = await crypto.subtle.sign('HMAC', key, data);
-            ok(send, Array.from(new Uint8Array(buf)));
-          } catch (e) { err(send, e); }
-        })();
-      },
-      'zlib.compress': (m, send) => {
-        void (async () => {
-          try {
-            const format = m['format'] as 'gzip' | 'deflate' | 'deflate-raw';
-            const data = Uint8Array.from(m['data'] as number[]);
-            const CS = (globalThis as { CompressionStream?: new (f: string) => { writable: WritableStream<Uint8Array>; readable: ReadableStream<Uint8Array> } }).CompressionStream;
-            if (!CS) { err(send, new Error('CompressionStream unavailable')); return; }
-            const cs = new CS(format);
-            const w = cs.writable.getWriter();
-            void w.write(data); void w.close();
-            const reader = cs.readable.getReader();
-            const chunks: Uint8Array[] = [];
-            let total = 0;
-            while (true) {
-              const r = await reader.read();
-              if (r.done) break;
-              if (r.value) { chunks.push(r.value); total += r.value.length; }
-            }
-            const out = new Uint8Array(total);
-            let off = 0;
-            for (const c of chunks) { out.set(c, off); off += c.length; }
-            ok(send, Array.from(out));
-          } catch (e) { err(send, e); }
-        })();
-      },
-      'zlib.decompress': (m, send) => {
-        void (async () => {
-          try {
-            const format = m['format'] as 'gzip' | 'deflate' | 'deflate-raw';
-            const data = Uint8Array.from(m['data'] as number[]);
-            const DS = (globalThis as { DecompressionStream?: new (f: string) => { writable: WritableStream<Uint8Array>; readable: ReadableStream<Uint8Array> } }).DecompressionStream;
-            if (!DS) { err(send, new Error('DecompressionStream unavailable')); return; }
-            const ds = new DS(format);
-            const w = ds.writable.getWriter();
-            void w.write(data); void w.close();
-            const reader = ds.readable.getReader();
-            const chunks: Uint8Array[] = [];
-            let total = 0;
-            while (true) {
-              const r = await reader.read();
-              if (r.done) break;
-              if (r.value) { chunks.push(r.value); total += r.value.length; }
-            }
-            const out = new Uint8Array(total);
-            let off = 0;
-            for (const c of chunks) { out.set(c, off); off += c.length; }
-            ok(send, Array.from(out));
-          } catch (e) { err(send, e); }
-        })();
-      },
-      'crypto.encrypt': (m, send) => {
-        if (!subtleAvailable) { err(send, new Error('SubtleCrypto unavailable')); return; }
-        void (async () => {
-          try {
-            const algName = (m['algorithm'] as string).toLowerCase();
-            const keyBytes = Uint8Array.from(m['key'] as number[]);
-            const ivBytes = Uint8Array.from(m['iv'] as number[]);
-            const plaintext = Uint8Array.from(m['plaintext'] as number[]);
-            let subtleAlg: AesCbcParams | AesGcmParams | AesCtrParams;
-            if (algName.endsWith('-gcm')) {
-              subtleAlg = { name: 'AES-GCM', iv: ivBytes };
-              if (m['aad']) (subtleAlg as AesGcmParams).additionalData = Uint8Array.from(m['aad'] as number[]);
-            } else if (algName.endsWith('-cbc')) {
-              subtleAlg = { name: 'AES-CBC', iv: ivBytes };
-            } else if (algName.endsWith('-ctr')) {
-              subtleAlg = { name: 'AES-CTR', counter: ivBytes, length: 64 };
-            } else {
-              err(send, new Error('Unsupported cipher: ' + algName));
-              return;
-            }
-            const key = await crypto.subtle.importKey('raw', keyBytes, subtleAlg.name, false, ['encrypt']);
-            const buf = await crypto.subtle.encrypt(subtleAlg, key, plaintext);
-            const out = new Uint8Array(buf);
-            if (algName.endsWith('-gcm')) {
-              const tagLen = 16;
-              const ct = out.slice(0, out.length - tagLen);
-              const tag = out.slice(out.length - tagLen);
-              ok(send, { ciphertext: Array.from(ct), authTag: Array.from(tag) });
-            } else {
-              ok(send, { ciphertext: Array.from(out) });
-            }
-          } catch (e) { err(send, e); }
-        })();
-      },
-      'crypto.decrypt': (m, send) => {
-        if (!subtleAvailable) { err(send, new Error('SubtleCrypto unavailable')); return; }
-        void (async () => {
-          try {
-            const algName = (m['algorithm'] as string).toLowerCase();
-            const keyBytes = Uint8Array.from(m['key'] as number[]);
-            const ivBytes = Uint8Array.from(m['iv'] as number[]);
-            let ciphertext = Uint8Array.from(m['ciphertext'] as number[]);
-            let subtleAlg: AesCbcParams | AesGcmParams | AesCtrParams;
-            if (algName.endsWith('-gcm')) {
-              subtleAlg = { name: 'AES-GCM', iv: ivBytes };
-              if (m['aad']) (subtleAlg as AesGcmParams).additionalData = Uint8Array.from(m['aad'] as number[]);
-              if (m['authTag']) {
-                const tag = Uint8Array.from(m['authTag'] as number[]);
-                const combined = new Uint8Array(ciphertext.length + tag.length);
-                combined.set(ciphertext);
-                combined.set(tag, ciphertext.length);
-                ciphertext = combined;
-              }
-            } else if (algName.endsWith('-cbc')) {
-              subtleAlg = { name: 'AES-CBC', iv: ivBytes };
-            } else if (algName.endsWith('-ctr')) {
-              subtleAlg = { name: 'AES-CTR', counter: ivBytes, length: 64 };
-            } else {
-              err(send, new Error('Unsupported cipher: ' + algName));
-              return;
-            }
-            const key = await crypto.subtle.importKey('raw', keyBytes, subtleAlg.name, false, ['decrypt']);
-            const buf = await crypto.subtle.decrypt(subtleAlg, key, ciphertext);
-            ok(send, { plaintext: Array.from(new Uint8Array(buf)) });
-          } catch (e) { err(send, e); }
-        })();
-      },
-      'crypto.pbkdf2': (m, send) => {
-        if (!subtleAvailable) { err(send, new Error('SubtleCrypto unavailable')); return; }
-        void (async () => {
-          try {
-            const digest = (m['digest'] as string).toUpperCase();
-            const pwd = Uint8Array.from(m['password'] as number[]);
-            const salt = Uint8Array.from(m['salt'] as number[]);
-            const iterations = m['iterations'] as number;
-            const keylen = m['keylen'] as number;
-            const baseKey = await crypto.subtle.importKey('raw', pwd, 'PBKDF2', false, ['deriveBits']);
-            const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations, hash: digest }, baseKey, keylen * 8);
-            ok(send, Array.from(new Uint8Array(bits)));
-          } catch (e) { err(send, e); }
-        })();
-      },
-      'crypto.generateKeyPair': (m, send) => {
-        if (!subtleAvailable) { err(send, new Error('SubtleCrypto unavailable')); return; }
-        void (async () => {
-          try {
-            const type = (m['type'] as string).toLowerCase();
-            let algorithm: RsaHashedKeyGenParams | EcKeyGenParams;
-            if (type === 'rsa' || type === 'rsa-pss') {
-              const modulusLength = (m['modulusLength'] as number) || 2048;
-              const hash = (m['hash'] as string | undefined) ?? 'SHA-256';
-              const publicExponent = new Uint8Array([0x01, 0x00, 0x01]);
-              algorithm = {
-                name: type === 'rsa-pss' ? 'RSA-PSS' : 'RSASSA-PKCS1-v1_5',
-                modulusLength,
-                publicExponent,
-                hash,
-              };
-            } else if (type === 'ec' || type === 'ecdsa') {
-              const namedCurve = (m['namedCurve'] as string | undefined) ?? 'P-256';
-              algorithm = { name: 'ECDSA', namedCurve };
-            } else {
-              err(send, new Error('Unsupported key type: ' + type));
-              return;
-            }
-            const kp = await crypto.subtle.generateKey(algorithm, true, ['sign', 'verify']);
-            const pubBuf = await crypto.subtle.exportKey('spki', (kp as CryptoKeyPair).publicKey);
-            const privBuf = await crypto.subtle.exportKey('pkcs8', (kp as CryptoKeyPair).privateKey);
-            ok(send, {
-              publicKey: Array.from(new Uint8Array(pubBuf)),
-              privateKey: Array.from(new Uint8Array(privBuf)),
-            });
-          } catch (e) { err(send, e); }
-        })();
-      },
-      'crypto.sign': (m, send) => {
-        if (!subtleAvailable) { err(send, new Error('SubtleCrypto unavailable')); return; }
-        void (async () => {
-          try {
-            const algName = (m['algorithm'] as string).toUpperCase();
-            const keyBytes = Uint8Array.from(m['key'] as number[]);
-            const data = Uint8Array.from(m['data'] as number[]);
-            const keyType = (m['keyType'] as string).toLowerCase();
-            // Detect signing algorithm + key import params
-            let importAlg: RsaHashedImportParams | EcKeyImportParams;
-            let signAlg: AlgorithmIdentifier | RsaPssParams | EcdsaParams;
-            const hash = (m['hash'] as string | undefined) ?? 'SHA-256';
-            if (keyType === 'rsa') {
-              importAlg = { name: 'RSASSA-PKCS1-v1_5', hash };
-              signAlg = 'RSASSA-PKCS1-v1_5';
-            } else if (keyType === 'rsa-pss') {
-              importAlg = { name: 'RSA-PSS', hash };
-              signAlg = { name: 'RSA-PSS', saltLength: (m['saltLength'] as number | undefined) ?? 32 };
-            } else if (keyType === 'ec' || keyType === 'ecdsa') {
-              const namedCurve = (m['namedCurve'] as string | undefined) ?? 'P-256';
-              importAlg = { name: 'ECDSA', namedCurve };
-              signAlg = { name: 'ECDSA', hash };
-            } else {
-              err(send, new Error('Unsupported key type for signing: ' + keyType));
-              return;
-            }
-            void algName;
-            const key = await crypto.subtle.importKey('pkcs8', keyBytes, importAlg, false, ['sign']);
-            const sig = await crypto.subtle.sign(signAlg, key, data);
-            ok(send, Array.from(new Uint8Array(sig)));
-          } catch (e) { err(send, e); }
-        })();
-      },
-      'crypto.verify': (m, send) => {
-        if (!subtleAvailable) { err(send, new Error('SubtleCrypto unavailable')); return; }
-        void (async () => {
-          try {
-            const keyBytes = Uint8Array.from(m['key'] as number[]);
-            const data = Uint8Array.from(m['data'] as number[]);
-            const signature = Uint8Array.from(m['signature'] as number[]);
-            const keyType = (m['keyType'] as string).toLowerCase();
-            let importAlg: RsaHashedImportParams | EcKeyImportParams;
-            let verifyAlg: AlgorithmIdentifier | RsaPssParams | EcdsaParams;
-            const hash = (m['hash'] as string | undefined) ?? 'SHA-256';
-            if (keyType === 'rsa') {
-              importAlg = { name: 'RSASSA-PKCS1-v1_5', hash };
-              verifyAlg = 'RSASSA-PKCS1-v1_5';
-            } else if (keyType === 'rsa-pss') {
-              importAlg = { name: 'RSA-PSS', hash };
-              verifyAlg = { name: 'RSA-PSS', saltLength: (m['saltLength'] as number | undefined) ?? 32 };
-            } else if (keyType === 'ec' || keyType === 'ecdsa') {
-              const namedCurve = (m['namedCurve'] as string | undefined) ?? 'P-256';
-              importAlg = { name: 'ECDSA', namedCurve };
-              verifyAlg = { name: 'ECDSA', hash };
-            } else {
-              err(send, new Error('Unsupported key type for verify: ' + keyType));
-              return;
-            }
-            const key = await crypto.subtle.importKey('spki', keyBytes, importAlg, false, ['verify']);
-            const valid = await crypto.subtle.verify(verifyAlg, key, signature, data);
-            ok(send, valid);
-          } catch (e) { err(send, e); }
-        })();
-      },
-    };
-
-    const parseFsFlags = (raw: string | number): number => {
-      if (typeof raw === 'number') return raw;
-      switch (raw) {
-        case 'r':   return O_RDONLY;
-        case 'r+':  return O_RDWR;
-        case 'w':   return O_WRONLY | O_CREAT | O_TRUNC;
-        case 'wx':  return O_WRONLY | O_CREAT | O_TRUNC | O_EXCL;
-        case 'w+':  return O_RDWR   | O_CREAT | O_TRUNC;
-        case 'wx+': return O_RDWR   | O_CREAT | O_TRUNC | O_EXCL;
-        case 'a':   return O_WRONLY | O_CREAT | O_APPEND;
-        case 'ax':  return O_WRONLY | O_CREAT | O_APPEND | O_EXCL;
-        case 'a+':  return O_RDWR   | O_CREAT | O_APPEND;
-        case 'ax+': return O_RDWR   | O_CREAT | O_APPEND | O_EXCL;
-        default: { const e: Error & { code?: string } = new Error('EINVAL: unknown flags ' + raw); e.code = 'EINVAL'; throw e; }
-      }
-    };
+    const cryptoFuncs = createCryptoFuncs();
 
     const fsFuncs: FuncTable = {
       'fs.watch.subscribe': (_m, send) => {
@@ -1871,123 +1850,12 @@ export class ProcessManager {
         if (subscriptions?.size === 0) this.fsWatchSubscriptions.delete(pid);
         ok(send, true);
       },
-      'fs.readFile': (m, send) => { void (async () => { try { ok(send, await fs.readFile(m['path'] as string)); } catch (e) { err(send, e); } })(); },
-      'fs.readFileBytes': (m, send) => { void (async () => {
-        try {
-          const bytes = await fs.readFileBytes(m['path'] as string, { pid: forPid ?? 0 });
-          ok(send, Array.from(bytes));
-        } catch (e) { err(send, e); }
-      })() },
-      'fs.writeFile': (m, send) => { void (async () => { try { await fs.writeFile(m['path'] as string, m['data'] as string); ok(send, true); } catch (e) { err(send, e); } })(); },
-      'fs.writeFileBytes': (m, send) => { void (async () => {
-        try {
-          const bytes = Uint8Array.from(m['data'] as number[]);
-          await fs.writeFileBytes(m['path'] as string, bytes, { pid: forPid ?? 0 });
-          ok(send, true);
-        } catch (e) { err(send, e); }
-      })() },
-      'fs.readdir': (m, send) => { void (async () => { try { ok(send, await fs.readdir(m['path'] as string)); } catch (e) { err(send, e); } })(); },
-      'fs.mkdir': (m, send) => { void (async () => { try { await fs.mkdir(m['path'] as string, { recursive: Boolean(m['recursive']) }); ok(send, true); } catch (e) { err(send, e); } })(); },
-      'fs.rm': (m, send) => { void (async () => { try { await fs.rm(m['path'] as string, { recursive: Boolean(m['recursive']) }); ok(send, true); } catch (e) { err(send, e); } })(); },
-      'fs.exists': (m, send) => { void (async () => { try { ok(send, await fs.exists(m['path'] as string)); } catch (e) { err(send, e); } })(); },
-      'fs.stat': (m, send) => { void (async () => { try { ok(send, await fs.stat(m['path'] as string)); } catch (e) { err(send, e); } })(); },
-      'fs.rename': (m, send) => { void (async () => { try { await fs.rename(m['from'] as string, m['to'] as string); ok(send, true); } catch (e) { err(send, e); } })(); },
-      'fs.symlink': (m, send) => { void (async () => { try { if (!fs.symlink) { err(send, new Error('ENOTSUP: symlink not supported')); return; } await fs.symlink(m['target'] as string, m['path'] as string); ok(send, true); } catch (e) { err(send, e); } })(); },
-      'fs.readlink': (m, send) => { void (async () => { try { if (!fs.readlink) { err(send, new Error('EINVAL: readlink not supported')); return; } ok(send, await fs.readlink(m['path'] as string)); } catch (e) { err(send, e); } })(); },
-      'fs.lstat': (m, send) => { void (async () => { try { const path = m['path'] as string; if (fs.lstat) { ok(send, await fs.lstat(path)); } else { ok(send, await fs.stat(path)); } } catch (e) { err(send, e); } })(); },
-
-      'fs.open': (m, send) => { void (async () => {
-        try {
-          const pid = (m['pid'] as number | undefined) ?? forPid ?? 0;
-          const flags = parseFsFlags((m['flags'] as string | number | undefined) ?? 'r');
-          const { handle, size, appendOnly } = await fs.openHandle(m['path'] as string, flags, { pid });
-          const tbl = this.getOrCreateFDTable(pid);
-          const fd = tbl.allocate({ backendHandle: handle, path: m['path'] as string, flags, appendOnly, position: appendOnly ? size : 0 });
-          ok(send, fd);
-        } catch (e) { err(send, e); }
-      })(); },
-
-      'fs.read': (m, send) => { void (async () => {
-        try {
-          const pid = (m['pid'] as number | undefined) ?? forPid ?? 0;
-          const fd = m['fd'] as number;
-          const length = m['length'] as number;
-          const pos = m['position'] as number | null | undefined;
-          const tbl = this.getOrCreateFDTable(pid);
-          const entry = tbl.get(fd);
-          if (!entry) { const e: Error & { code?: string } = new Error('EBADF: bad file descriptor'); e.code = 'EBADF'; throw e; }
-          const position = (pos === null || pos === undefined) ? entry.position : pos;
-          const res = await fs.readHandle(entry.backendHandle, length, position, { pid });
-          if (pos === null || pos === undefined) entry.position = position + res.bytesRead;
-          ok(send, { bytes: Array.from(res.bytes), bytesRead: res.bytesRead });
-        } catch (e) { err(send, e); }
-      })(); },
-
-      'fs.write': (m, send) => { void (async () => {
-        try {
-          const pid = (m['pid'] as number | undefined) ?? forPid ?? 0;
-          const fd = m['fd'] as number;
-          const data = Uint8Array.from(m['data'] as number[]);
-          const pos = m['position'] as number | null | undefined;
-          const tbl = this.getOrCreateFDTable(pid);
-          const entry = tbl.get(fd);
-          if (!entry) { const e: Error & { code?: string } = new Error('EBADF: bad file descriptor'); e.code = 'EBADF'; throw e; }
-          const position = entry.appendOnly ? 0 : ((pos === null || pos === undefined) ? entry.position : pos);
-          const res = await fs.writeHandle(entry.backendHandle, data, position, { pid });
-          if (!entry.appendOnly && (pos === null || pos === undefined)) entry.position = position + res.bytesWritten;
-          else if (entry.appendOnly) entry.position = position + res.bytesWritten;
-          ok(send, res.bytesWritten);
-        } catch (e) { err(send, e); }
-      })(); },
-
-      'fs.close': (m, send) => { void (async () => {
-        try {
-          const pid = (m['pid'] as number | undefined) ?? forPid ?? 0;
-          const fd = m['fd'] as number;
-          const tbl = this.getOrCreateFDTable(pid);
-          const entry = tbl.get(fd);
-          if (!entry) { const e: Error & { code?: string } = new Error('EBADF: bad file descriptor'); e.code = 'EBADF'; throw e; }
-          await fs.closeHandle(entry.backendHandle, { pid });
-          tbl.release(fd);
-          ok(send, true);
-        } catch (e) { err(send, e); }
-      })(); },
-
-      'fs.fstat': (m, send) => { void (async () => {
-        try {
-          const pid = (m['pid'] as number | undefined) ?? forPid ?? 0;
-          const fd = m['fd'] as number;
-          const entry = this.getOrCreateFDTable(pid).get(fd);
-          if (!entry) { const e: Error & { code?: string } = new Error('EBADF: bad file descriptor'); e.code = 'EBADF'; throw e; }
-          ok(send, await fs.fstatHandle(entry.backendHandle, { pid }));
-        } catch (e) { err(send, e); }
-      })(); },
-
-      'fs.ftruncate': (m, send) => { void (async () => {
-        try {
-          const pid = (m['pid'] as number | undefined) ?? forPid ?? 0;
-          const fd = m['fd'] as number;
-          const length = m['length'] as number;
-          const entry = this.getOrCreateFDTable(pid).get(fd);
-          if (!entry) { const e: Error & { code?: string } = new Error('EBADF: bad file descriptor'); e.code = 'EBADF'; throw e; }
-          await fs.ftruncateHandle(entry.backendHandle, length, { pid });
-          ok(send, true);
-        } catch (e) { err(send, e); }
-      })(); },
-
-      'fs.fsync': (m, send) => { void (async () => {
-        try {
-          const pid = (m['pid'] as number | undefined) ?? forPid ?? 0;
-          const fd = m['fd'] as number;
-          const entry = this.getOrCreateFDTable(pid).get(fd);
-          if (!entry) { const e: Error & { code?: string } = new Error('EBADF: bad file descriptor'); e.code = 'EBADF'; throw e; }
-          await fs.fsyncHandle(entry.backendHandle, { pid });
-          ok(send, true);
-        } catch (e) { err(send, e); }
-      })(); },
-
-      'module.resolve': (m, send) => { void (async () => { try { ok(send, await resolveSharedModule(fs, m['request'] as string, m['fromDir'] as string, (m['mode'] as 'import' | 'require' | undefined) ?? 'import', new Set(), this.nativePackageRegistry)); } catch (e) { err(send, e); } })(); },
-      'module.readSource': (m, send) => { void (async () => { try { const path = m['path'] as string; const source = this.nativePackageRegistry.readSource(path) ?? await fs.readFile(path, { pid: forPid ?? 0 }); ok(send, m['mode'] === 'import' && !path.endsWith('.json') ? await transformStaticImports(source) : source); } catch (e) { err(send, e); } })(); },
+      ...createFsFuncs({
+        fs,
+        pid: forPid ?? 0,
+        fdTable: (pid) => this.getOrCreateFDTable(pid),
+        nativePackageRegistry: this.nativePackageRegistry,
+      }),
     };
 
     const reg = this.socketRegistry;
@@ -2039,7 +1907,7 @@ export class ProcessManager {
                 offClose: () => {},
               };
               record.offData = plaintext.onData((data) => {
-                dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${socketId}, ${JSON.stringify(Array.from(data))});`);
+                dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${socketId}, ${this.bytesExpr(callerPid, data)});`);
               });
               record.offClose = plaintext.onClose(() => {
                 dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('end', ${socketId});`);
@@ -2107,7 +1975,7 @@ export class ProcessManager {
                 offClose: () => {},
               };
               record.offData = socket.onData((data) => {
-                dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${socketId}, ${JSON.stringify(Array.from(data))});`);
+                dispatchTo(callerPid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${socketId}, ${this.bytesExpr(callerPid, data)});`);
               });
               record.offClose = socket.onClose((_reason) => {
                 // The relay contract has no separate error callback. Any remote
@@ -2149,6 +2017,12 @@ export class ProcessManager {
         const srv = reg.findServer(host, port);
         if (!srv) {
           const pid = callerPid(m);
+          try {
+            assertAllowed(this.networkPolicy, { protocol: 'tcp:', host: host.toLowerCase(), port });
+          } catch (error) {
+            send({ error: formatErr(error) });
+            return;
+          }
           if (this.tcpProvider) {
             const socketId = reg.allocateSocketId();
             const record: ExternalTcpSocketRecord = {
@@ -2175,7 +2049,7 @@ export class ProcessManager {
                   return;
                 }
                 if (kind === 'data') {
-                  dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${socketId}, ${JSON.stringify(payload)});`);
+                  dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${socketId}, ${this.bytesExpr(pid, payload as Uint8Array)});`);
                   return;
                 }
                 if (kind === 'end') {
@@ -2186,7 +2060,7 @@ export class ProcessManager {
                 this.closeExternalTcpSocket(socketId, false);
               };
               stream.onData((data) => {
-                dispatchEvent('data', Array.from(data));
+                dispatchEvent('data', data);
               });
               stream.onEnd(() => {
                 dispatchEvent('end');
@@ -2226,7 +2100,7 @@ export class ProcessManager {
         const clientToServer: SocketPair = {
           pushToClient: (chunk) => {
             // server pushing back to the client
-            dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${clientSocketId}, ${JSON.stringify(Array.from(chunk))});`);
+            dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${clientSocketId}, ${this.bytesExpr(pid, chunk)});`);
           },
           closeClient: () => {
             dispatchTo(pid, `if (globalThis.__net) globalThis.__net.dispatch('end', ${clientSocketId});`);
@@ -2237,7 +2111,7 @@ export class ProcessManager {
         };
         const serverToClient: SocketPair = {
           pushToClient: (chunk) => {
-            dispatchTo(srv.enginePid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${serverSocketId}, ${JSON.stringify(Array.from(chunk))});`);
+            dispatchTo(srv.enginePid, `if (globalThis.__net) globalThis.__net.dispatch('data', ${serverSocketId}, ${this.bytesExpr(srv.enginePid, chunk)});`);
           },
           closeClient: () => {
             dispatchTo(srv.enginePid, `if (globalThis.__net) globalThis.__net.dispatch('end', ${serverSocketId});`);
@@ -2357,7 +2231,7 @@ export class ProcessManager {
             };
             const workerEngine = await this.engineFactory(workerPid, workerFuncs);
             workerHolder.dispatch = workerEngine.dispatch;
-            this.dispatchByPid.set(workerPid, workerEngine.dispatch);
+            this.trackEngine(workerPid, workerEngine);
 
             // Register a minimal record so process.bootstrap works
             const env = new Map<string, string>();
@@ -2397,7 +2271,7 @@ export class ProcessManager {
               this.cleanupNetworkForPid(workerPid);
               this.clearFSWatchSubscriptions(workerPid);
               this.processes.delete(workerPid);
-              this.dispatchByPid.delete(workerPid);
+              this.untrackEngine(workerPid);
               const parentDispatch = dispatchByPid.get(parentPid);
               if (parentDispatch) {
                 parentDispatch(`if (globalThis.__worker) globalThis.__worker.dispatchExit(${workerPid}, ${code});`);
@@ -2440,7 +2314,7 @@ export class ProcessManager {
           onChunk: (chunk) => {
             const d = this.dispatchByPid.get(consumerPid);
             if (!d) return;
-            d(`if (globalThis.__streams) globalThis.__streams.dispatch(${id}, 'chunk', ${JSON.stringify(Array.from(chunk))});`);
+            d(`if (globalThis.__streams) globalThis.__streams.dispatch(${id}, 'chunk', ${this.bytesExpr(consumerPid, chunk)});`);
           },
           onEnd: () => {
             const d = this.dispatchByPid.get(consumerPid);
@@ -2523,18 +2397,9 @@ export class ProcessManager {
         this._deliverSignalWithPayload(pid, 'SIGWINCH', { cols, rows });
         ok(send, true);
       },
-      'dns.lookup': (m, send) => {
-        const hostname = m['hostname'] as string;
-        // Best-effort: localhost/127.0.0.1 always resolve to 127.0.0.1.
-        if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0') {
-          send({ value: '127.0.0.1' });
-          return;
-        }
-        send({ value: hostname });
-      },
     };
 
-    return { ...processFuncs, ...cryptoFuncs, ...netFuncs, ...fsFuncs };
+    return { ...processFuncs, ...cryptoFuncs, ...netFuncs, ...fsFuncs, ...this.dnsFuncs };
   }
 
   private async buildEntry(cmd: string, args: string[], env: Record<string, string>, cwd: string): Promise<string> {
@@ -2563,6 +2428,6 @@ export class ProcessManager {
     //
     // A reserved entry without an explicit main promise is an interactive
     // keep-alive; only a later process.exit can complete it.
-    return `${prelude}try { await (async () => { ${body}\n })(); await Promise.resolve(); await Promise.resolve(); const __p = globalThis.__process; if (__p && __p._exitCode === undefined && __p.__duskLifecycle) { await (__p._exitReserved ? (__p.__mainPromise ?? new Promise(function(){})) : __p.__duskLifecycle.whenIdle()); } if (typeof process !== 'undefined' && process.exit && !(__p && __p._exitCode !== undefined)) process.exit(0); } catch (e) { try { console.error(String(e)); } catch (_) {} try { process.exit(1); } catch (_) {} }`;
+    return `${prelude}try { await (async () => { ${body}\n })(); await Promise.resolve(); await Promise.resolve(); const __p = globalThis.__process; if (__p && __p._exitCode === undefined && __p.__duskLifecycle) { await (__p._exitReserved ? (__p.__mainPromise ?? new Promise(function(){})) : __p.__duskLifecycle.whenIdle()); } if (typeof process !== 'undefined' && process.exit && !(__p && __p._exitCode !== undefined)) process.exit(); } catch (e) { try { console.error(String(e)); } catch (_) {} try { process.exit(1); } catch (_) {} }`;
   }
 }

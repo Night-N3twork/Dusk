@@ -4,9 +4,7 @@ node_modules/
 dist/
 .VSCodeCounter/
 .vitest-attachments/
-package-lock.json
 test/__screenshots__/
-/vendor/
 /lib/
 docs/
 graphify-out/

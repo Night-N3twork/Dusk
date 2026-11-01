@@ -7,9 +7,6 @@ import { walkOpfs, clearOpfs } from './opfs-view';
 import type { LibCurl } from '../host/net';
 
 const loadRealLibcurl = async (): Promise<LibCurl> => {
-  // Use Nova (Rust wisp client) as libcurl.js's drop-in replacement.
-  // Nova exposes a `LibCurl`-shaped class that satisfies DuskJS's
-  // `LibCurl` interface (see src/host/net.ts:9-25).
   const nova = await import('@nightnetwork/nova');
   await nova.default(); // wasm-bindgen init — loads the WASM binary
   return new nova.LibCurl() as unknown as LibCurl;

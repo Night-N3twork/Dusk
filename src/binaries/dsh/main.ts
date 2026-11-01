@@ -20,12 +20,27 @@ import { TfsFs } from './tfs-fs';
 import { python3Command, pythonCommand } from './commands/python3-command';
 import { dpmCommand } from './commands/dpm-command';
 import { curlCommand } from './commands/curl-command';
+import { tarCommand } from './commands/tar-command';
+import { gunzipCommand, gzipCommand, zcatCommand } from './commands/gzip-command';
+import { unzipCommand, zipCommand } from './commands/zip-command';
+import { patchCommand } from './commands/patch-command';
+import { lessCommand, moreCommand } from './commands/pager-command';
+import { nanoCommand, viCommand, vimCommand } from './commands/editor-command';
+import { externalCommand } from './commands/external-command';
+import { JobManager, PauseGate } from './jobs';
+import { History, KeyReader, LineEditor } from './line-editor';
+import { createCompleter } from './completion';
+import type { ExecResult, TerminalAccess } from '../../vendor/just-bash/types';
+import type { JobControl } from '../../vendor/just-bash/interpreter/types';
+
+const wait = globalThis.setTimeout.bind(globalThis);
 
 type ProcessGlobal = {
   argv: string[];
   env: Record<string, string>;
   cwd: () => string;
   exit?: (n: number) => void;
+  on?: (event: string, listener: (...args: unknown[]) => void) => unknown;
   stdin?: { read: () => Uint8Array | null };
   stdout: { write: (d: string | Uint8Array) => unknown };
   stderr: { write: (d: string | Uint8Array) => unknown };
@@ -46,40 +61,54 @@ const getProc = (): ProcessGlobal | undefined =>
 const getFs = (): FsGlobal | undefined =>
   (globalThis as Record<string, unknown>)['__fs'] as FsGlobal | undefined;
 
-const readStdinSync = (): Uint8Array | null => {
-  const ipc = (globalThis as { ipc?: { send: (m: unknown) => { value?: unknown; error?: string } } }).ipc;
-  if (!ipc) return null;
+interface StdinRead {
+  bytes: Uint8Array | null;
+  signal?: string;
+}
+
+const readStdinChunk = (wait: boolean): StdinRead => {
+  const ipc = (globalThis as { ipc?: { send: (m: unknown) => { value?: unknown; error?: string; signal?: string } } }).ipc;
+  if (!ipc) return { bytes: null };
   try {
-    const r = ipc.send({ f: 'proc.readStdin' });
-    if (r.error) return null;
+    const r = ipc.send(wait ? { f: 'proc.readStdin', wait: true } : { f: 'proc.readStdin' });
+    if (r.error) return { bytes: null };
+    if (r.signal) return { bytes: new Uint8Array(0), signal: r.signal };
     const v = r.value;
-    if (v === null || v === undefined) return null;
-    if (Array.isArray(v)) return new Uint8Array(v as number[]);
-    return null;
-  } catch { return null; }
+    if (v instanceof Uint8Array) return { bytes: v };
+    if (Array.isArray(v)) return { bytes: Uint8Array.from(v as number[]) };
+    return { bytes: null };
+  } catch { return { bytes: null }; }
 };
 
-const collectStdinAll = (): string => {
-  let s = '';
+const latin1FromBytes = (bytes: Uint8Array): string => {
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) out += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return out;
+};
+
+const bytesFromLatin1 = (text: string): Uint8Array => {
+  const bytes = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 0xff;
+  return bytes;
+};
+
+const readAllStdinBytes = (): Uint8Array[] => {
+  const chunks: Uint8Array[] = [];
   while (true) {
-    const chunk = readStdinSync();
-    if (chunk === null) break;
-    if (chunk.length === 0) {
-      // Poll gap; yield briefly. Engine setTimeout is fake so this is a no-op
-      // but keeps the loop from being a hot spin under real timers.
-      const deadline = Date.now() + 1;
-      while (Date.now() < deadline) { /* */ }
-      // If nothing new arrives on two consecutive polls, assume caller isn't
-      // sending more. Break to avoid hanging waiting for close.
-      const followup = readStdinSync();
-      if (followup === null) break;
-      if (followup.length === 0) break;
-      for (let i = 0; i < followup.length; i++) s += String.fromCharCode(followup[i]!);
-      continue;
-    }
-    for (let i = 0; i < chunk.length; i++) s += String.fromCharCode(chunk[i]!);
+    const { bytes, signal } = readStdinChunk(true);
+    if (bytes === null || signal) break;
+    if (bytes.length > 0) chunks.push(bytes);
   }
-  return s;
+  return chunks;
+};
+
+const readAllStdin = (): string => readAllStdinBytes().map(latin1FromBytes).join('');
+
+const readScriptFromStdin = (): string => {
+  const decoder = new TextDecoder();
+  let text = '';
+  for (const chunk of readAllStdinBytes()) text += decoder.decode(chunk, { stream: true });
+  return text + decoder.decode();
 };
 
 // Wire positional args into the shell's $0, $1, $#, $@, $* — matching
@@ -122,12 +151,28 @@ const composeNpmPath = (cwd: string, basePath: string): string => {
   return entries.join(':');
 };
 
+type OutputChunk = { stdout: string; stderr: string; stdoutKind?: 'text' | 'bytes' };
+
+const writeOutput = (proc: ProcessGlobal | undefined, chunk: OutputChunk): void => {
+  if (chunk.stdout) proc?.stdout.write(chunk.stdoutKind === 'bytes' ? bytesFromLatin1(chunk.stdout) : chunk.stdout);
+  if (chunk.stderr) proc?.stderr.write(chunk.stderr);
+};
+
+interface RunControls {
+  signal?: AbortSignal;
+  pauseGate?: () => Promise<void> | void;
+  lastExitCode?: number;
+  terminal?: TerminalAccess;
+}
+
 const runOnce = async (
   bash: Bash,
   script: string,
-  stdin: string,
+  readStdin: boolean,
+  jobs: JobControl,
   positionalArgs: string[] = [],
   scriptName = 'dsh',
+  controls: RunControls = {},
 ): Promise<number> => {
   const proc = getProc();
   if (dshCwdState === null) dshCwdState = proc?.cwd ? proc.cwd() : '/';
@@ -137,8 +182,14 @@ const runOnce = async (
   const path = proc?.env?.PATH ?? '/usr/local/bin:/usr/bin:/bin';
   const opts: Parameters<Bash['exec']>[1] = {
     cwd: dshCwdState,
-    stdin,
+    ...(readStdin ? { stdinLoader: readAllStdin, stdinKind: 'bytes' as const } : { stdin: '' }),
     env: { ...(proc?.env ?? {}), ...positionalEnv, PATH: composeNpmPath(dshCwdState, path) },
+    onOutput: (chunk) => writeOutput(proc, chunk),
+    jobControl: jobs,
+    ...(controls.signal ? { signal: controls.signal } : {}),
+    ...(controls.pauseGate ? { pauseGate: controls.pauseGate } : {}),
+    ...(controls.lastExitCode !== undefined ? { lastExitCode: controls.lastExitCode } : {}),
+    ...(controls.terminal ? { terminal: controls.terminal } : {}),
   };
   const result = await bash.exec(script, opts);
   // Persist any cd from this invocation. just-bash's exec restores state.cwd
@@ -147,16 +198,7 @@ const runOnce = async (
   // gets `cd /tmp` to persist between lines.
   const nextPwd = result.env?.['PWD'];
   if (typeof nextPwd === 'string' && nextPwd.length > 0) dshCwdState = nextPwd;
-  if (result.stdout) {
-    if (result.stdoutKind === 'bytes') {
-      const bytes = new Uint8Array(result.stdout.length);
-      for (let i = 0; i < result.stdout.length; i++) bytes[i] = result.stdout.charCodeAt(i) & 0xff;
-      proc?.stdout.write(bytes);
-    } else {
-      proc?.stdout.write(result.stdout);
-    }
-  }
-  if (result.stderr) proc?.stderr.write(result.stderr);
+  writeOutput(proc, { stdout: result.stdout, stderr: result.stderr, ...(result.stdoutKind ? { stdoutKind: result.stdoutKind } : {}) });
   return result.exitCode;
 };
 
@@ -317,32 +359,112 @@ const runNodeRepl = async (
   }
 };
 
-const runInteractive = async (bash: Bash): Promise<number> => {
+type Ipc = { send: (m: unknown) => { value?: unknown; error?: string } };
+
+const getIpc = (): Ipc | undefined => (globalThis as { ipc?: Ipc }).ipc;
+
+const ttyQuery = <T>(message: Record<string, unknown>, fallback: T): T => {
+  try {
+    const reply = getIpc()?.send(message);
+    return reply && !reply.error && reply.value !== undefined ? reply.value as T : fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+const expandHistory = (line: string, history: History): { line: string; error?: string } => {
+  if (!line.includes('!')) return { line };
+  let out = '';
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i]!;
+    if (char === '\\' && i + 1 < line.length) {
+      out += char + line[++i];
+      continue;
+    }
+    if (char === "'") quoted = !quoted;
+    if (char !== '!' || quoted) {
+      out += char;
+      continue;
+    }
+    const rest = line.slice(i + 1);
+    const last = history.size > 0 ? history.at(history.size - 1)! : undefined;
+    let match: RegExpExecArray | null;
+    if (rest.startsWith('!')) {
+      if (last === undefined) return { line, error: '!!: event not found' };
+      out += last;
+      i += 1;
+    } else if (rest.startsWith('$')) {
+      if (last === undefined) return { line, error: '!$: event not found' };
+      out += last.trim().split(/\s+/).pop() ?? '';
+      i += 1;
+    } else if ((match = /^-?\d+/.exec(rest))) {
+      const n = Number(match[0]);
+      const entry = history.at(n < 0 ? history.size + n : n - 1);
+      if (entry === undefined) return { line, error: `!${match[0]}: event not found` };
+      out += entry;
+      i += match[0].length;
+    } else if ((match = /^[A-Za-z_.\/][^\s;|&]*/.exec(rest)) && (i === 0 || /\s/.test(line[i - 1]!))) {
+      const prefix = match[0];
+      let found: string | undefined;
+      for (let j = history.size - 1; j >= 0; j--) {
+        if (history.at(j)!.startsWith(prefix)) { found = history.at(j); break; }
+      }
+      if (found === undefined) return { line, error: `!${prefix}: event not found` };
+      out += found;
+      i += prefix.length;
+    } else {
+      out += char;
+    }
+  }
+  return { line: out };
+};
+
+const createHistory = (fs: FsGlobal | undefined, home: string | undefined): History => {
+  const file = home ? `${home === '/' ? '' : home}/.dsh_history` : undefined;
+  return new History(file && fs ? {
+    load: () => {
+      try { return fs.exists(file) ? fs.readFile(file) : undefined; } catch { return undefined; }
+    },
+    save: (text) => fs.writeFile(file, text),
+  } : undefined);
+};
+
+const historyBuiltin = (history: History, args: string[]): ExecResult => {
+  if (args[0] === '-c') {
+    history.clear();
+    return { stdout: '', stderr: '', exitCode: 0 };
+  }
+  const entries = history.list();
+  const count = args[0] && /^\d+$/.test(args[0]) ? Math.min(Number(args[0]), entries.length) : entries.length;
+  let stdout = '';
+  for (let i = entries.length - count; i < entries.length; i++) stdout += `${String(i + 1).padStart(5)}  ${entries[i]}\n`;
+  return { stdout, stderr: '', exitCode: 0 };
+};
+
+const runInteractive = async (bash: Bash, jobs: JobManager, control: JobControl, history: History): Promise<number> => {
   const proc = getProc();
   if (!proc) return 1;
   const stdout = proc.stdout;
   const stderr = proc.stderr;
-  const ipc = (globalThis as { ipc?: { send: (m: unknown) => { value?: unknown; error?: string } } }).ipc;
-  if (!ipc) { stderr.write('dsh: no stdin available\n'); return 1; }
+  if (!getIpc()) { stderr.write('dsh: no stdin available\n'); return 1; }
 
-  const readStdin = (): Uint8Array | null => {
-    try {
-      const r = ipc.send({ f: 'proc.readStdin' });
-      if (r.error) return null;
-      const v = r.value;
-      if (v === null || v === undefined) return null;
-      if (Array.isArray(v)) return new Uint8Array(v as number[]);
-      return null;
-    } catch { return null; }
-  };
-  const decode = (bytes: Uint8Array): string => {
-    let s = '';
-    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]!);
-    return s;
+  const decoder = new TextDecoder();
+  const isTty = ttyQuery({ f: 'tty.isatty', fd: 0 }, false);
+
+  const pollChunk = async (timeoutMs?: number): Promise<Uint8Array | null | undefined> => {
+    const deadline = timeoutMs === undefined ? Infinity : Date.now() + timeoutMs;
+    let delay = 2;
+    while (true) {
+      const chunk = readStdinChunk(false).bytes;
+      if (chunk === null || chunk.length > 0) return chunk;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return undefined;
+      await new Promise<void>((resolve) => wait(resolve, Math.min(delay, remaining)));
+      delay = Math.min(delay * 2, 30);
+    }
   };
 
-  // A shared line-buffered reader so both dsh mode and node REPL mode can
-  // pull one line at a time from the same stdin stream.
   let lineBuf = '';
   const readLine = async (): Promise<string | null> => {
     while (true) {
@@ -352,33 +474,104 @@ const runInteractive = async (bash: Bash): Promise<number> => {
         lineBuf = lineBuf.slice(nl + 1);
         return line;
       }
-      const chunk = readStdin();
+      const chunk = await pollChunk();
+      if (chunk === undefined) continue;
       if (chunk === null) {
+        lineBuf += decoder.decode();
         if (lineBuf.length > 0) { const rest = lineBuf; lineBuf = ''; return rest; }
         return null;
       }
-      if (chunk.length === 0) {
-        await new Promise<void>((r) => setTimeout(r, 5));
-        continue;
-      }
-      lineBuf += decode(chunk);
+      lineBuf += decoder.decode(chunk, { stream: true });
     }
   };
 
+  const setRaw = (raw: boolean): void => {
+    if (isTty) ttyQuery({ f: 'tty.setRawMode', raw }, true);
+  };
+
+  const fsGlobal = getFs();
+  const winSize = (): number[] => ttyQuery<number[]>({ f: 'tty.getWinSize' }, [80, 24]);
+  const keys = new KeyReader(async (timeoutMs) => {
+    const chunk = await pollChunk(timeoutMs);
+    return chunk === null || chunk === undefined ? chunk : decoder.decode(chunk, { stream: true });
+  });
+  const terminal: TerminalAccess | undefined = isTty ? {
+    columns: () => winSize()[0] ?? 80,
+    rows: () => winSize()[1] ?? 24,
+    write: (data) => { stdout.write(data); },
+    readKey: async () => {
+      while (true) {
+        const key = await keys.next();
+        if (key !== undefined) return key;
+      }
+    },
+    pollKey: (timeoutMs) => keys.next(false, timeoutMs),
+    setRaw,
+  } : undefined;
+  const editor = isTty ? new LineEditor(
+    {
+      write: (text) => stdout.write(text),
+      columns: () => winSize()[0] ?? 80,
+    },
+    history,
+    createCompleter({
+      cwd: () => dshCwdState ?? '/',
+      env: () => proc.env ?? {},
+      commands: () => bash.getCommandNames(),
+      readdir: (path) => fsGlobal?.readdir(path) ?? [],
+      isDirectory: (path) => fsGlobal?.stat(path).isDirectory ?? false,
+    }),
+    keys,
+  ) : undefined;
+
+  let current: AbortController | undefined;
+  let interrupted = false;
+  proc.on?.('SIGINT', () => {
+    if (jobs.forwardSignal('SIGINT')) return;
+    if (current) {
+      interrupted = true;
+      current.abort();
+    }
+  });
+  proc.on?.('SIGTSTP', () => { jobs.forwardSignal('SIGTSTP'); });
+  proc.on?.('SIGQUIT', () => { jobs.forwardSignal('SIGQUIT'); });
+
   let exitCode = 0;
+  let warnedStopped = false;
   while (true) {
-    stdout.write('dsh$ ');
-    const line = await readLine();
+    const notices = jobs.notifications();
+    if (notices) stderr.write(notices);
+    let line: string | null;
+    if (editor) {
+      setRaw(true);
+      try {
+        line = await editor.readLine('dsh$ ');
+      } finally {
+        setRaw(false);
+      }
+    } else {
+      stdout.write('dsh$ ');
+      line = await readLine();
+    }
     if (line === null) break;
-    const script = line.trim();
+    const expanded = expandHistory(line, history);
+    if (expanded.error) {
+      stderr.write(`dsh: ${expanded.error}\n`);
+      continue;
+    }
+    if (expanded.line !== line) stdout.write(expanded.line + '\n');
+    const script = expanded.line.trim();
     if (script.length === 0) continue;
-    if (script === 'exit' || script === 'quit') {
-      stdout.write('\n');
+    history.add(expanded.line);
+    if (script === 'exit' || script === 'quit' || script === 'logout') {
+      if (jobs.hasJobs() && !warnedStopped) {
+        warnedStopped = true;
+        stderr.write('There are stopped or running jobs.\n');
+        continue;
+      }
       return exitCode;
     }
-    // `node` (with no args) enters the interactive REPL mode. This is a
-    // dsh-side hijack — the js-exec/node command in the registry only handles
-    // -c/-e/file mode; interactive belongs at the shell level.
+    warnedStopped = false;
     if (script === 'node') {
       try {
         await runNodeRepl(stdout, stderr, readLine);
@@ -387,11 +580,17 @@ const runInteractive = async (bash: Bash): Promise<number> => {
       }
       continue;
     }
+    current = new AbortController();
+    interrupted = false;
     try {
-      exitCode = await runOnce(bash, script, '');
+      const code = await runOnce(bash, script, false, control, [], 'dsh', { signal: current.signal, lastExitCode: exitCode, ...(terminal ? { terminal } : {}) });
+      exitCode = interrupted ? 130 : code;
+      if (interrupted) stdout.write('\n');
     } catch (e) {
       stderr.write('dsh: ' + String(e) + '\n');
       exitCode = 2;
+    } finally {
+      current = undefined;
     }
   }
   return exitCode;
@@ -410,6 +609,7 @@ export const main = async (): Promise<number> => {
   let scriptFile: string | null = null;
   let showHelp = false;
   let showVersion = false;
+  let scriptFromStdin = false;
   const scriptArgs: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -424,8 +624,8 @@ export const main = async (): Promise<number> => {
     } else if (a === '--help' || a === '-h') {
       showHelp = true;
     } else if (a === '-') {
-      // Read script from stdin
-      scriptInline = collectStdinAll();
+      scriptInline = readScriptFromStdin();
+      scriptFromStdin = true;
       break;
     } else if (!a.startsWith('-')) {
       scriptFile = a;
@@ -461,6 +661,24 @@ export const main = async (): Promise<number> => {
   }
   const jbFs = new TfsFs();
 
+  const history = createHistory(fs, proc.env?.['HOME']);
+  const interactive = scriptInline === null && scriptFile === null;
+  const jobs = new JobManager({
+    stdout: (data) => { proc.stdout.write(data); },
+    stderr: (data) => { proc.stderr.write(data); },
+    readInput: () => readStdinChunk(false).bytes,
+  }, interactive);
+  const gate = new PauseGate();
+  if (!interactive) {
+    proc.on?.('SIGTSTP', () => gate.pause());
+    proc.on?.('SIGCONT', () => gate.resume());
+  }
+  const shellControl: JobControl = {
+    background: (job) => jobs.background(job),
+    wait: (waitArgs) => jobs.wait(waitArgs),
+    builtin: (name, builtinArgs) => (name === 'history' ? Promise.resolve(historyBuiltin(history, builtinArgs)) : jobs.builtin(name, builtinArgs)),
+  };
+
   const bash = new Bash({
     fs: jbFs,
     // Enable JS: registers `js-exec` and `node` commands that route to a
@@ -478,19 +696,32 @@ export const main = async (): Promise<number> => {
       dpmCommand('npx'),
       dpmCommand('pnpm'),
       dpmCommand('dpx'),
+      tarCommand,
+      gzipCommand,
+      gunzipCommand,
+      zcatCommand,
+      zipCommand,
+      unzipCommand,
+      patchCommand,
+      lessCommand,
+      moreCommand,
+      nanoCommand,
+      viCommand,
+      vimCommand,
+      externalCommand('tsx'),
+      externalCommand('git'),
     ],
   });
 
   let code: number;
   if (scriptInline !== null) {
-    const stdin = readStdinInline();
     // For `dsh -c "script" arg0 arg1 arg2`: matches bash's -c behavior —
     // arg0 becomes $0, arg1 becomes $1, arg2 becomes $2. If no args, $0
     // defaults to 'dsh'. This is deliberately DIFFERENT from `dsh script`
     // (where $0 = script path). See POSIX sh -c behavior.
     const inlineScriptName = scriptArgs.length > 0 ? scriptArgs[0]! : 'dsh';
     const inlinePositional = scriptArgs.length > 0 ? scriptArgs.slice(1) : [];
-    code = await runOnce(bash, scriptInline, stdin, inlinePositional, inlineScriptName);
+    code = await runOnce(bash, scriptInline, !scriptFromStdin, shellControl, inlinePositional, inlineScriptName, { pauseGate: gate.wait });
   } else if (scriptFile !== null) {
     let content: string;
     try {
@@ -501,29 +732,12 @@ export const main = async (): Promise<number> => {
       if (proc.exit) proc.exit(1);
       return 1;
     }
-    const stdin = readStdinInline();
     // For `dsh script.sh a b c`: $0 = script.sh, $1... = a b c.
-    code = await runOnce(bash, content, stdin, scriptArgs, scriptFile);
+    code = await runOnce(bash, content, true, shellControl, scriptArgs, scriptFile, { pauseGate: gate.wait });
   } else {
-    code = await runInteractive(bash);
+    code = await runInteractive(bash, jobs, shellControl, history);
   }
 
   if (proc.exit) proc.exit(code);
   return code;
-};
-
-// Only collect stdin bytes if there are any immediately-available chunks;
-// don't block. Used for `dsh -c ...` where the caller may pipe input or not.
-const readStdinInline = (): string => {
-  const first = readStdinSync();
-  if (first === null || first.length === 0) return '';
-  let s = '';
-  for (let i = 0; i < first.length; i++) s += String.fromCharCode(first[i]!);
-  // Drain any additional chunks that are immediately available.
-  for (let iter = 0; iter < 1000; iter++) {
-    const chunk = readStdinSync();
-    if (chunk === null || chunk.length === 0) break;
-    for (let i = 0; i < chunk.length; i++) s += String.fromCharCode(chunk[i]!);
-  }
-  return s;
 };

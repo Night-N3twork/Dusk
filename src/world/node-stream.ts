@@ -538,7 +538,7 @@ export class Duplex extends Readable {
   }
 
   override destroy(err?: Error | null): this {
-    this._w.destroy(err);
+    this._w.destroy();
     return super.destroy(err);
   }
 }
@@ -678,3 +678,4 @@ export const nodeStreamPromises = {
   }),
   pipeline: (...streams: Array<Readable | Writable>): Promise<void> => pipeline(...streams) as Promise<void>,
 };
+(nodeStream as Record<string, unknown>)['promises'] = nodeStreamPromises;

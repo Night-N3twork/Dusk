@@ -1,5 +1,3 @@
-const HEX = '0123456789abcdef';
-
 export const escape = (s: string): string => {
   return encodeURIComponent(String(s)).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 };

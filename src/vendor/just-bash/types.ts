@@ -79,6 +79,7 @@ export interface CommandExecOptions {
    *     `gzip -d`.
    */
   stdinKind?: "text" | "bytes";
+  stdinLoader?: () => string;
   /**
    * Abort signal for cooperative cancellation.
    * When aborted, the interpreter stops executing at the next statement boundary.
@@ -127,6 +128,15 @@ export interface TraceEvent {
  * Trace callback function for receiving performance events
  */
 export type TraceCallback = (event: TraceEvent) => void;
+
+export interface TerminalAccess {
+  columns(): number;
+  rows(): number;
+  write(data: string): void;
+  readKey(): Promise<string | null>;
+  pollKey(timeoutMs: number): Promise<string | null | undefined>;
+  setRaw(raw: boolean): void;
+}
 
 export interface CommandContext {
   /** Virtual filesystem interface for file operations */
@@ -234,6 +244,7 @@ export interface CommandContext {
    * returns a JSON result string.
    */
   invokeTool?: (path: string, argsJson: string) => Promise<string>;
+  terminal?: TerminalAccess;
 }
 
 export interface Command {

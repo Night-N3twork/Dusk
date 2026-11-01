@@ -381,7 +381,7 @@ export class ClientRequest extends OutgoingMessage {
         url,
         method: this.method,
         headers: fetchHeaders,
-        body: Array.from(body),
+        body,
       }) as {
         status: number;
         statusText: string;

@@ -4,5 +4,6 @@ export { Interpreter } from "./interpreter.js";
 export type {
   InterpreterContext,
   InterpreterState,
+  LiveOutputChunk,
   ShellOptions,
 } from "./types.js";

@@ -49,7 +49,9 @@ import {
   Interpreter,
   type InterpreterOptions,
   type InterpreterState,
+  type LiveOutputChunk,
 } from "./interpreter/index.js";
+import { installLazyGroupStdin, type JobControl } from "./interpreter/types.js";
 import { type ExecutionLimits, resolveLimits } from "./limits.js";
 import {
   createSecureFetch,
@@ -73,6 +75,7 @@ import type {
   Command,
   CommandRegistry,
   FeatureCoverageWriter,
+  TerminalAccess,
   TraceCallback,
 } from "./types.js";
 
@@ -279,6 +282,7 @@ export interface ExecOptions {
    * it forwarded verbatim.
    */
   stdinKind?: "text" | "bytes";
+  stdinLoader?: () => string;
   /**
    * Abort signal for cooperative cancellation.
    * When aborted, the interpreter stops executing at the next statement boundary.
@@ -291,7 +295,14 @@ export interface ExecOptions {
    * positional parameters ($1, $2, "$@", etc.).
    */
   args?: string[];
+  onOutput?: (chunk: LiveOutputChunk) => void;
+  jobControl?: JobControl;
+  pauseGate?: () => Promise<void> | void;
+  lastExitCode?: number;
+  terminal?: TerminalAccess;
 }
+
+const nestedExecOptions = new WeakSet<object>();
 
 export class Bash {
   readonly fs: IFileSystem;
@@ -512,6 +523,10 @@ export class Bash {
     }
   }
 
+  getCommandNames(): string[] {
+    return Array.from(this.commands.keys());
+  }
+
   registerCommand(command: Command): void {
     this.commands.set(command.name, command);
     // Create command stubs in /bin and /usr/bin for PATH-based resolution
@@ -654,7 +669,18 @@ export class Bash {
       signal: options?.signal,
       // Extra arguments injected directly into first command's arg list
       extraArgs: options?.args,
+      pauseGate: options?.pauseGate,
+      exportedVars: new Set([
+        ...(options?.replaceEnv ? [] : this.state.exportedVars ?? []),
+        ...Object.keys(options?.env ?? {}).filter((name) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name)),
+      ]),
+      ...(options?.lastExitCode !== undefined ? { lastExitCode: options.lastExitCode } : {}),
     };
+    if (options?.stdinLoader && options.stdin === undefined) {
+      const loader = options.stdinLoader;
+      const kind = options.stdinKind;
+      installLazyGroupStdin(execState, () => encodeStdinForPipeline(loader(), kind) ?? "");
+    }
 
     // Normalize indented multi-line scripts (unless rawScript is true)
     // This allows writing indented bash scripts in template literals
@@ -669,7 +695,8 @@ export class Bash {
     const defenseBox = this.defenseInDepthConfig
       ? DefenseInDepthBox.getInstance(this.defenseInDepthConfig)
       : null;
-    const defenseHandle = defenseBox?.activate();
+    const nested = nestedExecOptions.has(options as object) && DefenseInDepthBox.isInSandboxedContext();
+    const defenseHandle = nested ? undefined : defenseBox?.activate();
 
     try {
       // Run execution inside defense-in-depth context if enabled
@@ -698,7 +725,11 @@ export class Bash {
           fs: this.fs,
           commands: this.commands,
           limits: this.limits,
-          exec: this.exec.bind(this),
+          exec: (script: string, nestedOptions?: ExecOptions) => {
+            const marked = { ...nestedOptions };
+            nestedExecOptions.add(marked);
+            return this.exec(script, marked);
+          },
           fetch: this.secureFetch,
           sleep: this.sleepFn,
           trace: this.traceFn,
@@ -706,6 +737,9 @@ export class Bash {
           requireDefenseContext: defenseBox?.isEnabled() === true,
           jsBootstrapCode: this.jsBootstrapCode,
           invokeTool: this.invokeToolFn,
+          onOutput: options?.onOutput,
+          jobControl: options?.jobControl,
+          terminal: options?.terminal,
         };
 
         const interpreter = new Interpreter(interpreterOptions, execState);

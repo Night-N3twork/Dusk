@@ -54,15 +54,15 @@ test('createRequire resolves relative requests from its filename', async () => {
   expect(out.join('')).toContain('relative:/app/lib/dep.js');
 }, 60_000);
 
-test('require rejects resolved ESM modules explicitly', async () => {
+test('require loads resolved ESM modules synchronously', async () => {
   const backend = createMemoryBackend();
-  await backend.writeFile('/module.mjs', 'export default 1;');
+  await backend.writeFile('/module.mjs', 'export default 1; export const named = "n";');
   const out: string[] = [];
   const runner = await createRunner(createFuncs(backend, (text) => out.push(text)));
-  await runner.run("try { require('./module.mjs'); } catch (error) { console.log(String(error)); }");
+  await runner.run("try { const m = require('./module.mjs'); console.log('ESM:' + m.default + ':' + m.named); } catch (error) { console.log(String(error)); }");
   runner.stop();
 
-  expect(out.join('')).toContain('ERR_REQUIRE_ESM');
+  expect(out.join('')).toContain('ESM:1:n');
 }, 60_000);
 
 test('require exposes TLS aliases through the builtin-module facade', async () => {

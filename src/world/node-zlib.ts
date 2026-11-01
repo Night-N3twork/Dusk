@@ -17,16 +17,7 @@ const toBytes = (data: unknown): Uint8Array => {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (ArrayBuffer.isView(data)) return new Uint8Array((data as ArrayBufferView).buffer, (data as ArrayBufferView).byteOffset, (data as ArrayBufferView).byteLength);
   if (Array.isArray(data)) return Uint8Array.from(data as number[]);
-  if (typeof data === 'string') {
-    const out: number[] = [];
-    for (let i = 0; i < data.length; i++) {
-      let c = data.charCodeAt(i);
-      if (c < 0x80) out.push(c);
-      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
-      else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
-    }
-    return Uint8Array.from(out);
-  }
+  if (typeof data === 'string') return new TextEncoder().encode(data);
   return new Uint8Array(0);
 };
 
@@ -38,7 +29,7 @@ const bytesToBuffer = (b: Uint8Array): Uint8Array => {
 
 // Format: 'gzip' | 'deflate' | 'deflate-raw'
 const callOp = (op: 'compress' | 'decompress', format: 'gzip' | 'deflate' | 'deflate-raw', data: Uint8Array): Uint8Array => {
-  const arr = __call(`zlib.${op}`, { format, data: Array.from(data) }) as number[] | undefined;
+  const arr = __call(`zlib.${op}`, { format, data }) as number[] | undefined;
   if (!arr) throw new Error(`zlib ${op} returned no data`);
   return bytesToBuffer(Uint8Array.from(arr));
 };

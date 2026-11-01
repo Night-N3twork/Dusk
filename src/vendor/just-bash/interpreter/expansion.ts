@@ -92,7 +92,7 @@ import {
 } from "./helpers/ifs.js";
 import { isNameref, resolveNameref } from "./helpers/nameref.js";
 import { getLiteralValue, isQuotedPart } from "./helpers/word-parts.js";
-import type { InterpreterContext } from "./types.js";
+import { captureOutput, type InterpreterContext } from "./types.js";
 
 // Re-export extracted functions for use elsewhere
 export { escapeGlobChars, escapeRegexChars } from "./expansion/glob-escape.js";
@@ -773,7 +773,7 @@ async function expandPart(
       const savedSuppressVerbose = ctx.state.suppressVerbose;
       ctx.state.suppressVerbose = true;
       try {
-        const result = await ctx.executeScript(part.body);
+        const result = await captureOutput(ctx, () => ctx.executeScript(part.body));
         // Restore environment but preserve exit code
         const exitCode = result.exitCode;
         ctx.state.env = savedEnv;

@@ -163,7 +163,7 @@ async function executeScript(
   const result = await ctx.exec(scriptToRun, {
     env: positionalEnv,
     cwd: ctx.cwd,
-    stdin: latin1FromBytes(ctx.stdin),
+    stdinLoader: () => latin1FromBytes(ctx.stdin),
     stdinKind: "bytes",
     signal: ctx.signal,
   });

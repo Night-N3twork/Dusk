@@ -44,3 +44,15 @@ test('node:stream begins a read-driven source when a data listener is attached',
 
   expect(out.join('')).toContain('value');
 }, 60_000);
+
+test('Duplex.destroy(err) emits a single error event', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  await repl.feed(
+    "const { Duplex } = require('node:stream'); const d = new Duplex({ read() {}, write(c, e, cb) { cb(); } }); let errors = 0; " +
+    "d.on('error', () => errors++); d.on('close', () => setTimeout(() => process.stdout.write('E:' + errors + ':END'), 10)); d.destroy(new Error('boom'));"
+  );
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  repl.engine.terminate();
+  expect(out.join('')).toContain('E:1:END');
+}, 60_000);

@@ -6,8 +6,7 @@
 // Coverage
 // - Direct passthrough: readFile, writeFile, readdir, mkdir, rm, exists,
 //   stat, mv (rename), appendFile.
-// - Synthesized: readFileBuffer / readFileBytes (latin1 → Uint8Array),
-//   readdirWithFileTypes (readdir+stat), cp recursive (walk+write),
+// - Synthesized: readdirWithFileTypes (readdir+stat), cp recursive (walk+write),
 //   lstat (= stat; TFS has no symlinks), realpath (= resolvePath; ditto),
 //   getAllPaths (walk from /, capped).
 // - No-op: chmod, utimes (TFS has no permissions and manages mtimes internally).
@@ -20,6 +19,7 @@
 // @ts-nocheck
 import { resolvePath as jbResolvePath } from '../../vendor/just-bash/fs/path-utils';
 import { unsafeBytesFromLatin1 } from '../../vendor/just-bash/encoding';
+import { fromBuffer, getEncoding, toBuffer } from '../../vendor/just-bash/fs/encoding';
 
 type FsGlobal = {
   readFile: (path: string) => string;
@@ -31,6 +31,8 @@ type FsGlobal = {
   stat: (path: string) => { isFile: boolean; isDirectory: boolean; size: number; mtimeMs: number };
   rename: (from: string, to: string) => void;
   appendFile: (path: string, data: string) => void;
+  readFileBytes: (path: string) => Uint8Array;
+  writeFileBytes: (path: string, data: Uint8Array) => void;
 };
 
 const getFs = (): FsGlobal => {
@@ -39,34 +41,11 @@ const getFs = (): FsGlobal => {
   return fs;
 };
 
-// Encode a latin1 string (each char is a byte, 0-255) to Uint8Array.
-// DuskJS's fs.readFile returns strings; binary content is preserved
-// character-per-byte, matching just-bash's ByteString convention.
-const latinToBytes = (s: string): Uint8Array => {
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
+const concatBytes = (a: Uint8Array, b: Uint8Array): Uint8Array => {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
   return out;
-};
-
-// Decode Uint8Array as latin1 for writing back through the string-based IPC.
-const bytesToLatin = (u: Uint8Array): string => {
-  let s = '';
-  for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]!);
-  return s;
-};
-
-const normalizeContent = (content: string | Uint8Array): string => {
-  if (typeof content === 'string') return content;
-  return bytesToLatin(content);
-};
-
-const asString = (content: string | Uint8Array, encoding?: string | null | { encoding?: string | null }): string => {
-  const enc = typeof encoding === 'string' ? encoding : encoding?.encoding;
-  if (typeof content !== 'string') return bytesToLatin(content);
-  // TFS returns strings; treat as-is unless caller asked for binary/latin1.
-  return content;
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  void enc;
 };
 
 export class TfsFs {
@@ -76,24 +55,22 @@ export class TfsFs {
   private fs(): FsGlobal { return getFs(); }
 
   // --- reads ------------------------------------------------------------
-  async readFile(path: string, _options?: unknown): Promise<string> {
-    return this.fs().readFile(path);
+  async readFile(path: string, options?: unknown): Promise<string> {
+    return fromBuffer(this.fs().readFileBytes(path), getEncoding(options));
   }
 
   async readFileBuffer(path: string): Promise<Uint8Array> {
-    return latinToBytes(this.fs().readFile(path));
+    return this.fs().readFileBytes(path);
   }
 
   async readFileBytes(path: string): Promise<any> {
-    // ByteString is a latin1-shaped opaque nominal type; tag the raw TFS
-    // string (each char = one byte) via the sanctioned helper.
-    return unsafeBytesFromLatin1(this.fs().readFile(path));
+    return unsafeBytesFromLatin1(fromBuffer(this.fs().readFileBytes(path), 'latin1'));
   }
 
   // --- writes -----------------------------------------------------------
-  async writeFile(path: string, content: string | Uint8Array, _options?: unknown): Promise<void> {
+  async writeFile(path: string, content: string | Uint8Array, options?: unknown): Promise<void> {
     this.ensureParent(path);
-    this.fs().writeFile(path, normalizeContent(content));
+    this.fs().writeFileBytes(path, toBuffer(content, getEncoding(options)));
   }
 
   // Synchronous variant — just-bash's Bash.registerCommand uses this to
@@ -107,7 +84,7 @@ export class TfsFs {
       // Command registration creates generated /bin and /usr/bin stubs. Keep
       // an existing package-manager shim at either path intact.
       if (typeof content === 'string' && content.startsWith('#!/bin/bash\n# Built-in command:') && this.fs().exists(path)) return;
-      this.fs().writeFile(path, normalizeContent(content));
+      this.fs().writeFileBytes(path, toBuffer(content));
     } catch { /* ignore, best-effort */ }
   }
 
@@ -123,8 +100,12 @@ export class TfsFs {
     } catch { /* best-effort */ }
   }
 
-  async appendFile(path: string, content: string | Uint8Array, _options?: unknown): Promise<void> {
-    this.fs().appendFile(path, normalizeContent(content));
+  async appendFile(path: string, content: string | Uint8Array, options?: unknown): Promise<void> {
+    const fs = this.fs();
+    const addition = toBuffer(content, getEncoding(options));
+    const existing = fs.exists(path) ? fs.readFileBytes(path) : new Uint8Array(0);
+    this.ensureParent(path);
+    fs.writeFileBytes(path, concatBytes(existing, addition));
   }
 
   // --- metadata / existence --------------------------------------------
@@ -214,7 +195,7 @@ export class TfsFs {
         await this.cp(s, d, options);
       }
     } else {
-      fs.writeFile(dest, fs.readFile(src));
+      fs.writeFileBytes(dest, fs.readFileBytes(src));
     }
   }
 

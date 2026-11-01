@@ -807,12 +807,16 @@ test('per-request proxy opt reaches the active instance fetch', async () => {
   expect(JSON.stringify(stub.seenOpts)).toContain('socks5h://127.0.0.1:1080');
 }, 60_000);
 
-test.skip('fetch returns a body through libcurl.js (live Wisp proxy)', async () => {
+test.skip('fetch returns a body through Nova (live Wisp proxy)', async () => {
   const vfs = createMemoryBackend();
   const out: string[] = [];
   let runner: Awaited<ReturnType<typeof createRunner>>;
   const net = createNet(
-    async () => (await import('libcurl.js')).libcurl as never,
+    async () => {
+      const nova = await import('@nightnetwork/nova');
+      await nova.default();
+      return new nova.LibCurl() as never;
+    },
     (js) => runner.dispatch(js),
     `wss://${location.hostname}/ws/`,
   );

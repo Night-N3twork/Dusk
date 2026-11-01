@@ -14,9 +14,8 @@ const __call = (f: string, extra: Record<string, unknown> = {}): unknown => {
   return r.value;
 };
 
-const _workerData = (typeof __DUSK_PID__ !== 'undefined' && __DUSK_PID__ !== undefined && (globalThis as Record<string, unknown>)['__DUSK_WORKER_DATA__']) as unknown;
 const _isMainThread = !(globalThis as Record<string, unknown>)['__DUSK_WORKER_DATA__'];
-const _parentPid = (globalThis as Record<string, unknown>)['__DUSK_PARENT_PID__'] as number | undefined;
+const _workerData = (_isMainThread ? null : (globalThis as Record<string, unknown>)['__DUSK_WORKER_DATA__']) as unknown;
 const _threadId = (typeof __DUSK_PID__ !== 'undefined' && __DUSK_PID__ !== undefined) ? __DUSK_PID__ : 0;
 
 // Worker child tracking (parent side)

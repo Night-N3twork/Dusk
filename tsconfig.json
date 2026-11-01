@@ -20,6 +20,6 @@
     },
     "outDir": "dist"
   },
-  "include": ["src", "test", "vite.config.ts", "vitest.config.ts"],
+  "include": ["src", "test", "examples", "vite.config.ts", "vitest.config.ts"],
   "exclude": ["reference", "node_modules", "dist", "src/vendor"]
 }

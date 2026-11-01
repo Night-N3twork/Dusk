@@ -3,6 +3,7 @@ import { createRunner } from '../src/host/runner';
 import { createMemoryBackend } from '../src/host/fs-backend';
 import { createFuncs } from '../src/host/funcs';
 import { startRepl } from '../src/repl/repl';
+import { bootRepl } from '../src/index';
 
 test('repl evaluates a line and prints the result', async () => {
   const backend = createMemoryBackend();
@@ -92,4 +93,12 @@ test('repl has no implementation binding object in the guest global', async () =
   runner.stop();
 
   expect(out.join('')).toContain('undefined');
+}, 60_000);
+
+test('REPL evaluates an expression that ends with a semicolon', async () => {
+  const out: string[] = [];
+  const repl = await bootRepl((t) => out.push(t), { fs: 'memory' });
+  await repl.feed("process.stdout.write('SEMI:' + (1 + 1) + ':END');");
+  repl.engine.terminate();
+  expect(out.join('')).toContain('SEMI:2:END');
 }, 60_000);

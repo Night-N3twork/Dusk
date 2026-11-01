@@ -43,6 +43,7 @@ import type {
   CommandRegistry,
   ExecResult,
   FeatureCoverageWriter,
+  TerminalAccess,
   TraceCallback,
 } from "../types.js";
 import { expandAlias as expandAliasHelper } from "./alias-expansion.js";
@@ -109,7 +110,8 @@ import {
   executeSubshell as executeSubshellHelper,
   executeUserScript as executeUserScriptHelper,
 } from "./subshell-group.js";
-import type { InterpreterContext, InterpreterState } from "./types.js";
+import { captureOutput } from "./types.js";
+import type { JobControl, LiveOutputChunk, InterpreterContext, InterpreterState } from "./types.js";
 
 export type { InterpreterContext, InterpreterState } from "./types.js";
 
@@ -143,6 +145,9 @@ export interface InterpreterOptions {
   jsBootstrapCode?: string;
   /** Tool invoker hook for js-exec's `tools` proxy */
   invokeTool?: (path: string, argsJson: string) => Promise<string>;
+  onOutput?: (chunk: LiveOutputChunk) => void;
+  jobControl?: JobControl;
+  terminal?: TerminalAccess;
 }
 
 export class Interpreter {
@@ -165,6 +170,10 @@ export class Interpreter {
       requireDefenseContext: options.requireDefenseContext ?? false,
       jsBootstrapCode: options.jsBootstrapCode,
       invokeTool: options.invokeTool,
+      onOutput: options.onOutput,
+      captureDepth: 0,
+      jobControl: options.jobControl,
+      terminal: options.terminal,
     };
   }
 
@@ -263,7 +272,7 @@ export class Interpreter {
         // unambiguous at the script boundary.
         if (node.statements.length === 1) {
           appendOutput(result.stdout, result.stderr);
-          stdoutKind = result.stdoutKind;
+          stdoutKind = result.stdoutKind ?? (result.stdoutEncoding === "binary" ? "bytes" : undefined);
         } else {
           appendOutput(decodedTextFromResult(result), result.stderr);
         }
@@ -394,11 +403,26 @@ export class Interpreter {
   }
 
   private async executeStatement(node: StatementNode): Promise<ExecResult> {
+    const executed = await this.executeStatementInner(node);
+    const onOutput = this.ctx.onOutput;
+    if (!onOutput || (this.ctx.captureDepth ?? 0) > 0) return executed;
+    if (!executed.stdout && !executed.stderr) return executed;
+    onOutput({ stdout: executed.stdout, stderr: executed.stderr, stdoutKind: executed.stdoutKind });
+    return { ...executed, stdout: "", stderr: "", stdoutKind: undefined };
+  }
+
+  private async executeStatementInner(node: StatementNode): Promise<ExecResult> {
     this.assertDefenseContext("statement");
 
     // Check for abort signal (cooperative cancellation by timeout command)
     if (this.ctx.state.signal?.aborted) {
       throw new ExecutionAbortedError();
+    }
+    if (this.ctx.state.pauseGate) {
+      await this.ctx.state.pauseGate();
+      if (this.ctx.state.signal?.aborted) {
+        throw new ExecutionAbortedError();
+      }
     }
 
     this.ctx.state.commandCount++;
@@ -419,6 +443,18 @@ export class Interpreter {
     // noexec mode (set -n): parse commands but do not execute them
     // This is used for syntax checking scripts without actually running them
     if (this.ctx.state.options.noexec) {
+      return OK;
+    }
+
+    if (node.background && this.ctx.jobControl && node.sourceText) {
+      const source = node.sourceText.replace(/\s*&\s*$/, "");
+      this.ctx.state.lastBackgroundPid = this.ctx.jobControl.background({
+        source,
+        cwd: this.ctx.state.cwd,
+        env: mapToRecord(this.ctx.state.env),
+      });
+      this.ctx.state.lastExitCode = 0;
+      this.ctx.state.env.set("?", "0");
       return OK;
     }
 
@@ -457,7 +493,7 @@ export class Interpreter {
       // Unicode chunks (which would defeat the output-boundary UTF-8 decode).
       if (node.pipelines.length === 1) {
         stdout += result.stdout;
-        stdoutKind = result.stdoutKind;
+        stdoutKind = result.stdoutKind ?? (result.stdoutEncoding === "binary" ? "bytes" : undefined);
       } else {
         stdout += decodedTextFromResult(result);
       }
@@ -513,6 +549,16 @@ export class Interpreter {
     this.assertDefenseContext("command");
 
     this.ctx.coverage?.hit(`bash:cmd:${node.type}`);
+    if (this.ctx.onOutput && "redirections" in node && node.redirections && node.redirections.length > 0) {
+      return captureOutput(this.ctx, () => this.dispatchCommand(node, stdin));
+    }
+    return this.dispatchCommand(node, stdin);
+  }
+
+  private async dispatchCommand(
+    node: CommandNode,
+    stdin: string,
+  ): Promise<ExecResult> {
     switch (node.type) {
       case "SimpleCommand":
         return this.executeSimpleCommand(node, stdin);

@@ -37,7 +37,7 @@ import { handleLoopError } from "./helpers/loop.js";
 import { failure, result, throwExecutionLimit } from "./helpers/result.js";
 import { executeStatements } from "./helpers/statements.js";
 import { applyRedirections, preOpenOutputRedirects } from "./redirections.js";
-import type { InterpreterContext } from "./types.js";
+import { restoreGroupStdin, saveGroupStdin, type InterpreterContext } from "./types.js";
 
 export async function executeIf(
   ctx: InterpreterContext,
@@ -297,7 +297,7 @@ export async function executeWhile(
   }
 
   // Save and set groupStdin for piped while loops
-  const savedGroupStdin = ctx.state.groupStdin;
+  const savedGroupStdin = saveGroupStdin(ctx.state);
   if (effectiveStdin) {
     ctx.state.groupStdin = effectiveStdin;
   }
@@ -391,7 +391,7 @@ export async function executeWhile(
     }
   } finally {
     ctx.state.loopDepth--;
-    ctx.state.groupStdin = savedGroupStdin;
+    restoreGroupStdin(ctx.state, savedGroupStdin);
   }
 
   return result(stdout, stderr, exitCode);
