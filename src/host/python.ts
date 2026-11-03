@@ -15,6 +15,7 @@
 
 import type { FuncTable } from './engine-instance';
 import type { FSBackend } from './fs-backend';
+import { createEnvMounter, type EnvMounter } from './python-env';
 
 type PyodideInterface = {
   runPython: (code: string) => unknown;
@@ -33,7 +34,7 @@ type PyodideInterface = {
 
 let pyodidePromise: Promise<PyodideInterface> | undefined;
 
-const loadPyodide = async (): Promise<PyodideInterface> => {
+export const loadPyodide = async (): Promise<PyodideInterface> => {
   if (!pyodidePromise) {
     pyodidePromise = (async (): Promise<PyodideInterface> => {
       // The pyodide package exports a `loadPyodide` factory. We call it with
@@ -68,6 +69,14 @@ const asStr = (v: unknown): string => {
   return String(v);
 };
 
+// One mounter per filesystem: it remembers what is already in Pyodide.
+const mounters = new WeakMap<FSBackend, EnvMounter>();
+const mounterFor = (fs: FSBackend): EnvMounter => {
+  let mounter = mounters.get(fs);
+  if (!mounter) { mounter = createEnvMounter(fs); mounters.set(fs, mounter); }
+  return mounter;
+};
+
 export const createPythonFuncs = (fs: FSBackend): FuncTable => ({
   // python.exec { code: string, argv?: string[], stdin?: string, scriptPath?: string, cwd?: string }
   //   → { stdout: string, stderr: string, exitCode: number }
@@ -81,11 +90,20 @@ export const createPythonFuncs = (fs: FSBackend): FuncTable => ({
         const argv = (m['argv'] as string[] | undefined) ?? ['python3'];
         const stdin = (m['stdin'] as string | undefined) ?? '';
         const scriptPath = m['scriptPath'] as string | undefined;
+        const cwd = m['cwd'] as string | undefined;
+        const env = (m['env'] as Record<string, string> | undefined) ?? {};
+
+        // Packages uv installed into the active virtualenv become importable.
+        let mountWarning = '';
+        if (cwd !== undefined) {
+          const outcome = await mounterFor(fs).sync(py as unknown as Parameters<EnvMounter['sync']>[0], cwd, env);
+          if (outcome.warning) mountWarning = `python3: ${outcome.warning}\n`;
+        }
 
         // Buffer stdout/stderr for this execution. Pyodide's setStdout
         // is process-global, not per-call, so we swap it around this run.
         let stdoutBuf = '';
-        let stderrBuf = '';
+        let stderrBuf = mountWarning;
         py.setStdout({ batched: (s) => { stdoutBuf += asStr(s) + '\n'; } });
         py.setStderr({ batched: (s) => { stderrBuf += asStr(s) + '\n'; } });
 
@@ -151,7 +169,7 @@ ${scriptPath ? `__file__ = ${JSON.stringify(scriptPath)}` : ''}
       } catch (e) { err(send, e); }
     })();
   },
-  // Marker so TS uses `fs` (a hook for future TFS↔Pyodide auto-sync).
+  // Marker so TS uses `fs` outside python.exec.
   __py_touch_fs: ((_m: Record<string, unknown>, send: (m: unknown) => void): void => {
     void fs; ok(send, { ok: true });
   }) as unknown as FuncTable[string],

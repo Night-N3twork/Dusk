@@ -37,6 +37,18 @@ const call = (f: string, args: Record<string, unknown> = {}): unknown => {
   return r.value;
 };
 
+// python.exec with the caller's directory and environment, so the host can
+// mount the active virtualenv (see host/python-env.ts).
+const pyExec = (args: Record<string, unknown>): { stdout: string; stderr: string; exitCode: number } => {
+  const proc = getProc();
+  const virtualEnv = proc?.env['VIRTUAL_ENV'];
+  return call('python.exec', {
+    cwd: proc?.cwd() ?? '/',
+    env: virtualEnv ? { VIRTUAL_ENV: virtualEnv } : {},
+    ...args,
+  }) as { stdout: string; stderr: string; exitCode: number };
+};
+
 type FsGlobal = {
   readFile: (p: string) => string;
   exists: (p: string) => boolean;
@@ -137,7 +149,7 @@ const runRepl = async (): Promise<number> => {
         const code = block;
         block = '';
         try {
-          const r = call('python.exec', { code }) as { stdout: string; stderr: string; exitCode: number };
+          const r = pyExec({ code });
           if (r.stdout) proc.stdout.write(r.stdout);
           if (r.stderr) proc.stderr.write(r.stderr);
         } catch (e) {
@@ -150,7 +162,7 @@ const runRepl = async (): Promise<number> => {
         const code = block;
         block = '';
         try {
-          const r = call('python.exec', { code }) as { stdout: string; stderr: string; exitCode: number };
+          const r = pyExec({ code });
           if (r.stdout) proc.stdout.write(r.stdout);
           if (r.stderr) proc.stderr.write(r.stderr);
         } catch (e) {
@@ -162,7 +174,7 @@ const runRepl = async (): Promise<number> => {
     // Single-line statement or expression.
     if (line.trim() === '') continue;
     try {
-      const r = call('python.exec', { code: line }) as { stdout: string; stderr: string; exitCode: number };
+      const r = pyExec({ code: line });
       if (r.stdout) proc.stdout.write(r.stdout);
       if (r.stderr) proc.stderr.write(r.stderr);
     } catch (e) {
@@ -237,7 +249,7 @@ export const main = async (): Promise<number> => {
     if (!stdinIsTty()) {
       const piped = readStdinAll();
       const argvForPy = ['python3', ...scriptArgs];
-      const r = call('python.exec', { code: piped, argv: argvForPy }) as { stdout: string; stderr: string; exitCode: number };
+      const r = pyExec({ code: piped, argv: argvForPy });
       if (r.stdout) proc.stdout.write(r.stdout);
       if (r.stderr) proc.stderr.write(r.stderr);
       const code = r.exitCode ?? 0;
@@ -277,11 +289,11 @@ export const main = async (): Promise<number> => {
 
   const argvForPy = [displayName, ...scriptArgs];
   try {
-    const r = call('python.exec', {
+    const r = pyExec({
       code,
       argv: argvForPy,
       scriptPath: scriptPath ?? undefined,
-    }) as { stdout: string; stderr: string; exitCode: number };
+    });
     if (r.stdout) proc.stdout.write(r.stdout);
     if (r.stderr) proc.stderr.write(r.stderr);
     const exitCode = r.exitCode ?? 0;

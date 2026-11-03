@@ -12,7 +12,8 @@ import { createLayoutBackend } from './host/fs-layout';
 import { createMountBackend } from './host/fs-mount';
 import { createFileSystemAccessBackend } from './host/fs-access';
 import { exportSnapshot, importSnapshot, type SnapshotExportOptions, type SnapshotImportOptions } from './host/snapshot';
-import { createPythonFuncs } from './host/python';
+import { createPythonFuncs, loadPyodide } from './host/python';
+import { createUvHost, type UvHost, type UvOptions } from './host/uv';
 import { loadDuskExtensions, type DuskExtensionHost } from './host/extensions';
 import { startRepl, type DuskRepl } from './repl/repl';
 import { createEngineFactory, type DuskRuntime, type EngineInstance, type FuncTable } from './host/engine-instance';
@@ -56,6 +57,8 @@ export { default as previewServiceWorkerSource } from './preview/preview-sw.js?r
 export type { NetworkPolicy, NetworkTarget } from './host/network-policy';
 export type { ProcessLimits, ProcessManagerEventMap } from './host/process-manager';
 export type { DnsAnswer, DnsRecordType, DnsResolver } from './host/dns';
+export { createUvHost } from './host/uv';
+export type { UvHost, UvHostDeps, UvOptions } from './host/uv';
 
 export type BootReplNetOptions = BootReplNetTransportOptions & { dns?: DnsResolver; allow?: NetworkPolicy | readonly string[] };
 
@@ -103,6 +106,12 @@ export interface BootReplOptions {
   /** Project whose DPM lockfile authorizes the requested extensions. */
   extensionCwd?: string;
   limits?: ProcessLimits;
+  /**
+   * uv (via tholus) as /bin/uv, /bin/pip and /bin/pip3. On by default; the
+   * ~18 MiB engine loads on the first command, never at boot. Pass `false`
+   * to leave the commands out entirely.
+   */
+  uv?: UvOptions | false;
 }
 
 export interface BootReplResult extends DuskRepl {
@@ -111,6 +120,8 @@ export interface BootReplResult extends DuskRepl {
   tcpProvider?: TcpProvider;
   /** pid-0 engine. Present unless `skipPidZero: true`, in which case it's a stub. */
   engine: EngineInstance;
+  /** The uv bridge, unless `uv: false`. Its engine boots on first use. */
+  uv?: UvHost;
   /** Present when `via: 'node'` — the spawned /bin/node child handle. */
   node?: DuskProcessHandle;
   registerWispTransport(name: string, factory: unknown): void;
@@ -244,6 +255,19 @@ export const bootRepl = async (
     ...extraFuncs,
   };
 
+  let uv: UvHost | undefined;
+  if (options?.uv !== false) {
+    uv = createUvHost({
+      fs: backend,
+      loadPyodide: loadPyodide as unknown as Parameters<typeof createUvHost>[0]['loadPyodide'],
+      ...(networkPolicy ? { networkPolicy } : {}),
+      ...(options?.uv ? { options: options.uv } : {}),
+    });
+    pm.registerStreamingHostBinary('/bin/uv', uv.uv);
+    pm.registerStreamingHostBinary('/bin/pip', uv.pip);
+    pm.registerStreamingHostBinary('/bin/pip3', uv.pip);
+  }
+
   // Optionally skip pid-0 — saves ~100MB of RAM by not spawning an entire
   // SpiderMonkey Worker for the `feed()` path. Only meaningful for callers
   // that will never call `.feed()` and only use `processManager.spawn(...)`.
@@ -271,6 +295,7 @@ export const bootRepl = async (
   }
 
   const dispose = async (): Promise<void> => {
+    await uv?.dispose().catch(() => undefined);
     await pm.dispose();
     if (engine.pid === 0) await engine.terminate().catch(() => 0);
   };
@@ -304,7 +329,7 @@ export const bootRepl = async (
     const feed = async (line: string): Promise<void> => {
       await nodeHandle.stdin.write(encoder.encode(line + '\n'));
     };
-    return { feed, processManager: pm, engine, node: nodeHandle, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport, ...files, dispose };
+    return { feed, processManager: pm, engine, node: nodeHandle, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport, ...files, ...(uv ? { uv } : {}), dispose };
   }
 
   if (options?.skipPidZero) {
@@ -313,9 +338,9 @@ export const bootRepl = async (
     const feed = async (): Promise<void> => {
       throw new Error('bootRepl: feed() unavailable when skipPidZero:true. Spawn a shell via processManager.spawn(\'/bin/dsh\', ...) and write to its stdin.');
     };
-    return { feed, processManager: pm, engine, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport, ...files, dispose };
+    return { feed, processManager: pm, engine, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport, ...files, ...(uv ? { uv } : {}), dispose };
   }
 
   const repl = startRepl(engine, write);
-  return { feed: repl.feed, processManager: pm, engine, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport, ...files, dispose };
+  return { feed: repl.feed, processManager: pm, engine, ...(tcpProvider ? { tcpProvider } : {}), registerWispTransport, ...files, ...(uv ? { uv } : {}), dispose };
 };

@@ -38,9 +38,19 @@ const toBytes = (value: unknown): Uint8Array => {
   return new Uint8Array(0);
 };
 
-const runAttached = async (binary: string, args: string[], ctx: CommandContext): Promise<ExecResult> => {
+export interface ExternalCommandOptions {
+  /**
+   * Tell the binary its output reaches a terminal, as DUSK_TTY=<cols>x<rows>.
+   * For host binaries, which get no PTY of their own (see host/uv.ts).
+   */
+  announceTty?: boolean;
+}
+
+const runAttached = async (binary: string, args: string[], ctx: CommandContext, options: ExternalCommandOptions): Promise<ExecResult> => {
   const terminal = ctx.terminal!;
-  const child = spawnAsync!(binary, args, { cwd: ctx.cwd, env: environment(ctx) });
+  const env = environment(ctx);
+  if (options.announceTty) env['DUSK_TTY'] = `${terminal.columns()}x${terminal.rows()}`;
+  const child = spawnAsync!(binary, args, { cwd: ctx.cwd, env });
   const encoder = new TextEncoder();
   const out = new TextDecoder();
   const err = new TextDecoder();
@@ -82,11 +92,11 @@ const runBuffered = (binary: string, args: string[], ctx: CommandContext): ExecR
   };
 };
 
-export const externalCommand = (name: string, binary = `/bin/${name}`): Command => ({
+export const externalCommand = (name: string, binary = `/bin/${name}`, options: ExternalCommandOptions = {}): Command => ({
   name,
   trusted: true,
   async execute(args, ctx) {
-    if (ctx.terminal && spawnAsync) return runAttached(binary, args, ctx);
+    if (ctx.terminal && spawnAsync) return runAttached(binary, args, ctx, options);
     return runBuffered(binary, args, ctx);
   },
 });

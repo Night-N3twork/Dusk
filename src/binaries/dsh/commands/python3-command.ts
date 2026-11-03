@@ -84,9 +84,13 @@ export const python3Command: Command = {
 
     try {
       const argvForPy = [displayName, ...scriptArgs];
+      const virtualEnv = ctx.env.get('VIRTUAL_ENV');
       const r = call('python.exec', {
         code, argv: argvForPy, stdin: stdinText,
         scriptPath: scriptPath ?? undefined,
+        // Lets the host mount the active virtualenv (see host/python-env.ts).
+        cwd: ctx.cwd,
+        env: virtualEnv ? { VIRTUAL_ENV: virtualEnv } : {},
       }) as { stdout: string; stderr: string; exitCode: number };
       return { stdout: r.stdout ?? '', stderr: r.stderr ?? '', exitCode: r.exitCode ?? 0 };
     } catch (e) {

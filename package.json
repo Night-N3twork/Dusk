@@ -55,6 +55,8 @@
   "devDependencies": {
     "@babel/standalone": "^8.0.4",
     "@terbiumos/tfs": "^1.0.24",
+    "@tholus/core": "^1.1.0",
+    "@tholus/pyodide": "^1.1.0",
     "@types/node": "^24.10.1",
     "@vitest/browser": "^4.1.11",
     "@vitest/browser-playwright": "^4.1.11",

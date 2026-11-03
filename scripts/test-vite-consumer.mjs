@@ -27,9 +27,13 @@ try {
         await fs.writeFile('/main.mjs', "import { answer } from './dep.mjs'; export const value = answer;");
         await repl.engine.run("console.log('esm=' + (await import('/main.mjs')).value)");
         const help = await repl.processManager.spawnSync('/bin/dpm', ['--help'], { cwd: '/' });
+        const uv = await repl.processManager.spawnSync('/bin/uv', ['--version'], { cwd: '/' });
+        await repl.uv?.dispose();
         globalThis.__duskResult = {
           dpmStatus: help.status,
           help: new TextDecoder().decode(help.stdout),
+          uvStatus: uv.status,
+          uv: new TextDecoder().decode(uv.stdout) + new TextDecoder().decode(uv.stderr),
           output: output.join(''),
         };
         await repl.engine.terminate();
@@ -48,7 +52,7 @@ try {
   });
 
   const assets = await readdir(join(root, 'dist', 'assets'));
-  for (const pattern of [/^browser\.min(?:-[\w-]+)?\.js$/, /^esbuild(?:-[\w-]+)?\.wasm$/, /^dpm_wasm_bg(?:-[\w-]+)?\.wasm$/]) {
+  for (const pattern of [/^browser\.min(?:-[\w-]+)?\.js$/, /^esbuild(?:-[\w-]+)?\.wasm$/, /^dpm_wasm_bg(?:-[\w-]+)?\.wasm$/, /^engine_bg(?:-[\w-]+)?\.wasm$/, /^uv-worker(?:-[\w-]+)?\.js$/]) {
     const asset = assets.find((name) => pattern.test(name));
     assert.ok(asset, `Vite consumer did not emit ${pattern}`);
     assert.ok((await readFile(join(root, 'dist', 'assets', asset))).byteLength > 0, `Empty Vite asset ${asset}`);
@@ -81,11 +85,13 @@ try {
     assert.equal(result.dpmStatus, 0);
     assert.match(result.help, /Dusk Package Manager/);
     assert.match(result.output, /esm=42/);
+    assert.equal(result.uvStatus, 0, result.uv);
+    assert.match(result.uv, /^uv \d+\.\d+\.\d+/);
   } finally {
     await browser.close();
     await new Promise((resolveClose, rejectClose) => server.httpServer.close((error) => error ? rejectClose(error) : resolveClose()));
   }
-  console.log('Packed Vite consumer booted Dusk, transformed ESM, and ran DPM help');
+  console.log('Packed Vite consumer booted Dusk, transformed ESM, ran DPM help and booted uv');
 } finally {
   await rm(root, { recursive: true, force: true });
 }
