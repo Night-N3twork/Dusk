@@ -17,8 +17,10 @@
 // What uv cannot do here: `uv run` and `uvx` spawn an interpreter, which the
 // wasm engine cannot do, so they fail with uv's own message.
 
-import { createEngine, type Engine, type EngineConfigInput, type EngineEndpoint, type ExecOptions } from '@tholus/core';
-import { attachPyodide, type PyodideLike, type PyodideRuntime } from '@tholus/pyodide';
+// Types only: the SDK (and the zod schemas behind its protocol) loads with the
+// engine, on the first command, not with Dusk.
+import type { Engine, EngineConfigInput, EngineEndpoint, ExecOptions } from '@tholus/core';
+import type { PyodideLike, PyodideRuntime } from '@tholus/pyodide';
 // Resolved here, on the main thread, so an app bundling Dusk's library build
 // emits them too (see uv-worker.ts). Plain assets: bundling the engine module
 // would inline its fallback wasm URL as a second, base64 copy of the wasm.
@@ -185,12 +187,14 @@ export const createUvHost = (deps: UvHostDeps): UvHost => {
         ...(options.index ? { index: options.index } : {}),
         ...(options.env ? { env: options.env } : {}),
       };
+      const { createEngine } = await import('@tholus/core');
       const created = await createEngine({
         endpoint: deps.createEndpoint ?? (() => workerEndpoint(deps.networkPolicy)),
         config,
       });
       detachRuntime = created.attachRuntime(async (invocation) => {
-        pyRuntime ??= deps.loadPyodide().then((py) => attachPyodide(created, py));
+        pyRuntime ??= Promise.all([deps.loadPyodide(), import('@tholus/pyodide')])
+          .then(([py, { attachPyodide }]) => attachPyodide(created, py));
         return (await pyRuntime).hook(invocation);
       });
       return created;

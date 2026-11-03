@@ -11,7 +11,8 @@
 // otherwise the nearest `.venv` holding a `pyvenv.cfg` in the working
 // directory or one of its ancestors.
 
-import { attachPyodide, type PyodideLike } from '@tholus/pyodide';
+// Types only: the adapter loads the first time there is an environment to mount.
+import type { PyodideLike } from '@tholus/pyodide';
 import type { FSBackend } from './fs-backend';
 import { collectTree, signTree } from './uv-tree';
 
@@ -110,6 +111,7 @@ export const createEnvMounter = (fs: FSBackend): EnvMounter => {
       if (current) py.runPython(UNMOUNT(MOUNT_ROOT));
       current = undefined;
 
+      const { attachPyodide } = await import('@tholus/pyodide');
       const runtime = attachPyodide({
         exportTree: async (path) => {
           const { entries, bytes } = await collectTree(fs, path);
