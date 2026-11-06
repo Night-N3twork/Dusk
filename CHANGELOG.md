@@ -18,6 +18,8 @@
 - `node:dns`: `lookup` and the `resolve*` family over DNS-over-HTTPS, with loopback names answered locally.
 - A compatibility manifest that tests check (`test/fixtures/compat.json`) and `scripts/compat-table.mjs`, which renders it into the README.
 - CI on every push, a GitHub Pages workflow for the demo, and example programs in `examples/` that are typechecked with the rest of the code.
+- `uv`, `pip` and `pip3`, backed by uv compiled to WebAssembly ([tholus](https://github.com/KDust7/tholus)). The engine loads on first use. Projects and venvs stay in Dusk's filesystem, `python3` imports what they install, and sdists build through Pyodide. Configure it with `bootRepl({ uv })` or turn it off with `uv: false`. The bridge is exported as `createUvHost()`.
+- `ProcessManager.spawnSync()` runs streaming host binaries.
 
 ### Changed
 

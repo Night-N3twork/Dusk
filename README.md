@@ -12,6 +12,7 @@ DuskJS runs native JavaScript inside Web Workers by default, with SpiderMonkey W
 - The shell, dsh, has pipes, redirects and functions. It also has job control (`&`, `jobs`, `fg`, `bg`, `kill`, `wait`, `^Z`, `^C`), line editing, history that survives a reload, and tab completion.
 - Alongside `grep`, `sed`, `awk`, `jq`, `find` and about 90 other commands, the shell ships `git`, `tsx`, `tar`, `gzip`, `zip`/`unzip`, `diff`/`patch`, `less`, `nano` and `vi`.
 - `/bin/node` is an interactive REPL, and `python3` runs on Pyodide.
+- `uv`, `pip` and `pip3` run [uv](https://github.com/astral-sh/uv) compiled to WebAssembly by [tholus](https://github.com/KDust7/tholus), with real dependency resolution. Packages they install can be imported from `python3`.
 - Files live in the Origin Private File System, so they're still there after a reload. You can also mount a folder from the user's disk.
 - A directory tree can be exported as `.tar.gz`, imported elsewhere, or shared as a URL.
 - A Service Worker can route browser requests to an `http.createServer()` running inside Dusk, which means a dev server can load in an iframe.
@@ -123,6 +124,7 @@ The main entry point. Boots the runtime, initializes the filesystem, and optiona
 | `extensions` | `DuskExtensionHost[]` | `[]` | Host extensions to activate from packages installed by DPM |
 | `extensionCwd` | `string` | `/home/<user>` | Project whose DPM lockfile authorizes those extensions |
 | `nativePackageReplacements` | `NativePackageReplacementEntries` | `undefined` | Browser builds to use in place of native-only packages |
+| `uv` | `UvOptions \| false` | `{}` | Package indexes, transport, cache and environment for `uv`/`pip` (see [Python packages](#python-packages-uv)). `false` leaves the commands out. |
 
 ### SSH Adapter
 
@@ -244,7 +246,7 @@ const repl = await bootRepl(write, {
 repl.processManager.on('exit', ({ pid, code, signal }) => console.log(pid, signal ?? code));
 ```
 
-- `allow` takes host patterns (`*.example.com`), optional ports (`:443`) and optional schemes (`https://`), or a function that receives `{ protocol, host, port }`. Blocked requests fail with `ERR_DUSK_NETWORK_BLOCKED`. The policy covers `fetch`, `node:http`/`https`, `node:net`, `node:tls`, WebSockets and DPM downloads.
+- `allow` takes host patterns (`*.example.com`), optional ports (`:443`) and optional schemes (`https://`), or a function that receives `{ protocol, host, port }`. Blocked requests fail with `ERR_DUSK_NETWORK_BLOCKED`. The policy covers `fetch`, `node:http`/`https`, `node:net`, `node:tls`, WebSockets, DPM downloads and every request `uv` makes. For `uv` against PyPI, allow `pypi.org` and `files.pythonhosted.org`.
 - `limits.maxProcesses` makes `spawn` fail with `EAGAIN` once the limit is reached. `timeoutMs` sends `SIGKILL` when it runs out. `maxOutputBytes` stops a process with `SIGXFSZ` when it writes too much.
 - There's no memory limit, because browsers don't let a page cap a single worker's memory. `limits` and `dispose()` are the tools you have for runaway code.
 
@@ -276,6 +278,27 @@ repl.mount('/mnt/project', folder); // processes now read and write the user's f
 
 Archives are gzipped POSIX tar with PAX headers for long names, so plain `tar -xzf` can open them. An import never writes outside its `root`.
 
+## Python packages (uv)
+
+`uv`, `pip` and `pip3` are backed by [tholus](https://github.com/KDust7/tholus), which compiles [uv](https://github.com/astral-sh/uv) to WebAssembly. Resolution uses uv's real PubGrub resolver, so you get backtracking, lockfiles and readable conflict reports.
+
+```sh
+$ cd ~/project
+$ uv venv
+$ uv pip install rich
+$ python3 -c "import rich; rich.print('[bold]hello[/bold]')"
+```
+
+- Nothing loads at boot. On the first command the uv engine (about 18 MiB of WebAssembly) boots in a worker of its own. Downloads are cached in OPFS, so they survive a reload.
+- `pip X` runs `uv pip X`. When `pip install` has no target and finds no virtualenv, it creates `.venv` in the project first, then installs into it.
+- uv works on Dusk's own filesystem. Before each command Dusk copies the project into uv: the nearest directory with a `pyproject.toml`, `uv.lock`, `.venv` or `requirements.txt`, plus `$VIRTUAL_ENV` when it lies outside that directory. When the command finishes, whatever uv changed is copied back. `node_modules`, `.git` and `__pycache__` are left out, and a project larger than 512 MiB is refused. Because the venv lives in Dusk's filesystem, `ls` sees it, snapshots include it and it survives a reload.
+- `/bin/python3` mounts the active virtualenv before it runs. That is `$VIRTUAL_ENV`, or else the nearest `.venv`. An environment holding extension modules built for a different Python is refused with a warning rather than half-imported.
+- Source distributions build in the browser, because uv runs their PEP 517 hooks in the same Pyodide that `python3` uses.
+- TFS, which backs `/home`, cannot store symlinks. Links uv creates, such as a venv's `bin/python`, are recorded in `.dusk-symlinks.json` and handed back to uv as links next time.
+- `uv run` and `uvx` don't work yet, because they start an interpreter process and the wasm engine can't. Use `python3` with the venv instead.
+
+`bootRepl({ uv })` takes `index` (`indexUrl`, `extraIndexUrls`, `pyodideIndex`), `transport`, `cache` and `env`, which are passed through to tholus. `uv: false` removes the commands. The bridge is also exported as `createUvHost()` for hosts that build their own `ProcessManager`.
+
 ## Shell Commands (dsh)
 
 `dsh` is the default shell. It parses and runs bash syntax using a vendored copy of just-bash.
@@ -289,7 +312,7 @@ Archives are gzipped POSIX tar with PAX headers for long names, so plain `tar -x
 | **Data** | `jq`, `yq`, `base64`, `md5sum`, `od`, `strings` |
 | **Interactive** | `less`, `more`, `nano`, `vi`/`vim` |
 | **Development** | `git`, `node`, `tsx`, `python3`, `curl`, `wget` |
-| **Packages** | `dpm`, `dpx`, `npm`, `npx`, `pnpm` |
+| **Packages** | `dpm`, `dpx`, `npm`, `npx`, `pnpm`, `uv`, `pip`, `pip3` |
 
 It handles pipes, redirects, here-docs, functions, arrays, `$(...)`, `&&`/`||` and background jobs.
 
@@ -497,7 +520,7 @@ Set `DUSK_ALLOWED_HOSTS` (comma-separated) to let other hostnames reach the dev 
 npm test             # source-boundary check, then vitest in Chromium via Playwright
 ```
 
-Tests run in Chromium through `@vitest/browser-playwright`, which gives them `SharedArrayBuffer`, OPFS and Service Workers. The Python and engine-pool tests download assets, so they fail without network access.
+Tests run in Chromium through `@vitest/browser-playwright`, which gives them `SharedArrayBuffer`, OPFS and Service Workers. The Python and engine-pool tests download assets, so they fail without network access. The uv tests run the real engine offline, plus a fake engine behind tholus's real worker protocol.
 
 ## Contributing
 

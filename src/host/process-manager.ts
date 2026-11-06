@@ -1439,6 +1439,42 @@ export class ProcessManager {
         stderr: toBytes(result.stderr),
       };
     }
+    const streamingHostBinary = this.streamingHostBinaries.get(cmd);
+    if (streamingHostBinary) {
+      // Run it to completion with stdin supplied up front and closed, the
+      // way spawnSync runs everything else.
+      const stdout: Uint8Array[] = [];
+      const stderr: Uint8Array[] = [];
+      const stdinBytes = normalizeStdin(options.stdin);
+      const stdin = new ReadableStream<Uint8Array>({
+        start(controller) {
+          if (stdinBytes) controller.enqueue(stdinBytes);
+          controller.close();
+        },
+      });
+      const join = (chunks: Uint8Array[]): Uint8Array => {
+        const out = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0));
+        let at = 0;
+        for (const chunk of chunks) { out.set(chunk, at); at += chunk.byteLength; }
+        return out;
+      };
+      let status: number;
+      try {
+        const process = await streamingHostBinary({
+          args,
+          cwd: options.cwd ?? '/',
+          env: options.env ?? {},
+          stdin,
+          stdout: async (chunk) => { stdout.push(chunk.slice()); },
+          stderr: async (chunk) => { stderr.push(chunk.slice()); },
+        });
+        status = await process.exit;
+      } catch (error) {
+        stderr.push(textEncoder.encode(`${cmd}: ${error instanceof Error ? error.message : String(error)}\n`));
+        status = 1;
+      }
+      return { status, stdout: join(stdout), stderr: join(stderr) };
+    }
     const pid = this.nextPid++;
     const stdoutChunks: Uint8Array[] = [];
     const stderrChunks: Uint8Array[] = [];

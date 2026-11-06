@@ -710,6 +710,9 @@ export const main = async (): Promise<number> => {
       vimCommand,
       externalCommand('tsx'),
       externalCommand('git'),
+      externalCommand('uv', '/bin/uv', { announceTty: true }),
+      externalCommand('pip', '/bin/pip', { announceTty: true }),
+      externalCommand('pip3', '/bin/pip3', { announceTty: true }),
     ],
   });
 
